@@ -264,10 +264,19 @@ fn parse_javascript_number(value: &str) -> Option<f64> {
                 .map(|character| character.to_digit(radix).map(|digit| digit as u8))
                 .collect::<Option<Vec<_>>>()?;
             // JavaScript parses the entire prefixed integer exactly and rounds
-            // once when converting it to Number. BigUint's f64 conversion uses
-            // round-to-odd before the final nearest-ties-to-even conversion,
-            // preserving that behavior without intermediate digit rounding.
-            return BigUint::from_radix_be(&digits, radix).and_then(|number| number.to_f64());
+            // once when converting it to Number. Its finite radix interval
+            // extends to (but excludes) 2^1024, while BigUint reports overflow
+            // for the portion that rounds above f64::MAX under IEEE conversion.
+            // Preserve JavaScript's finite cutoff explicitly.
+            return BigUint::from_radix_be(&digits, radix).map(|number| {
+                number.to_f64().unwrap_or_else(|| {
+                    if number.bits() <= 1024 {
+                        f64::MAX
+                    } else {
+                        f64::INFINITY
+                    }
+                })
+            });
         }
     }
     value.parse::<f64>().ok()

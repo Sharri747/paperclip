@@ -87,6 +87,24 @@ fn rounds_large_prefixed_integers_like_javascript_number() {
 }
 
 #[test]
+fn accepts_radix_integers_in_javascripts_upper_finite_interval() {
+    let mut unbounded_set = question_set();
+    let validation = unbounded_set["questions"][3]["textValidation"]
+        .as_object_mut()
+        .unwrap();
+    validation.remove("minimum");
+    validation.remove("maximum");
+
+    let mut response = valid_response();
+    response["answers"]["count"] = json!({"text":format!("0x{}", "f".repeat(256))});
+    validate_question_response(&unbounded_set, &response)
+        .expect("the largest radix integer below 2^1024 rounds to Number.MAX_VALUE");
+
+    response["answers"]["count"] = json!({"text":format!("0x1{}", "0".repeat(256))});
+    assert!(validate_question_response(&unbounded_set, &response).is_err());
+}
+
+#[test]
 fn treats_ecmascript_bom_whitespace_as_an_empty_required_answer() {
     let mut unconstrained_set = question_set();
     unconstrained_set["questions"][2]
