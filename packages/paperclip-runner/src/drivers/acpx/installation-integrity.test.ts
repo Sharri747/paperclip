@@ -21,6 +21,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { resolveQualifiedAcpxProfile } from "./qualified-profiles.js";
 import {
   guardSnapshotModuleLookup,
+  guardSnapshotModuleResolution,
+  sanitizedNodeEnvironment,
+  snapshotDescriptorAncestorIndex,
   verifiedExecutableOpenFlags,
   verifyQualifiedAcpxInstallation,
 } from "./installation-integrity.js";
@@ -61,6 +64,50 @@ describe("ACPX installation integrity", () => {
       "builtin",
     );
     expect(builtinLookup).toHaveBeenCalledOnce();
+  });
+
+  it("rejects host-ancestry file resolutions outside retained descriptors", () => {
+    const commandDirectoryUrl = "file:///proc/self/fd/4/";
+    const dependencyDirectoryUrls = [
+      "file:///proc/self/fd/5/",
+      "file:///proc/self/fd/6/",
+    ];
+    const hostShadowUrl =
+      "file:///proc/self/fd/node_modules/host-shadow/index.js";
+    const hostShadowIndex = snapshotDescriptorAncestorIndex(
+      hostShadowUrl,
+      commandDirectoryUrl,
+      dependencyDirectoryUrls,
+    );
+    expect(hostShadowIndex).toBe(-1);
+    expect(() =>
+      guardSnapshotModuleResolution(false, hostShadowUrl, hostShadowIndex >= 0),
+    ).toThrow("escaped descriptor-pinned ancestry");
+
+    const verifiedUrl = "file:///proc/self/fd/5/node_modules/verified/index.js";
+    const verifiedIndex = snapshotDescriptorAncestorIndex(
+      verifiedUrl,
+      commandDirectoryUrl,
+      dependencyDirectoryUrls,
+    );
+    expect(verifiedIndex).toBe(0);
+    expect(() =>
+      guardSnapshotModuleResolution(false, verifiedUrl, verifiedIndex >= 0),
+    ).not.toThrow();
+    expect(() =>
+      guardSnapshotModuleResolution(false, "data:text/javascript,0", false),
+    ).not.toThrow();
+  });
+
+  it("removes every case variant of Node module-loader overrides", () => {
+    expect(
+      sanitizedNodeEnvironment({
+        PATH: "/verified/bin",
+        NODE_PATH: "/unverified/one",
+        node_path: "/unverified/two",
+        NoDe_OpTiOnS: "--require=/unverified/preload.cjs",
+      }),
+    ).toEqual({ PATH: "/verified/bin" });
   });
 
   it("fails closed when the platform cannot atomically open without following symlinks", () => {
@@ -265,6 +312,67 @@ describe("ACPX installation integrity", () => {
         env: { ...process.env, node_options: `--require=${preload}` },
       }),
       "verified",
+    );
+  });
+
+  it("drops inherited and caller-supplied Node package search paths", async () => {
+    const fixture = await installationFixture();
+    const command = [
+      'const value = require("unverified-node-path-package");',
+      "process.stdout.write(value);",
+    ].join("\n");
+    const unverifiedPackage = join(
+      fixture.root,
+      "unverified-node-path",
+      "unverified-node-path-package",
+    );
+    await mkdir(unverifiedPackage, { recursive: true });
+    await Promise.all([
+      writeFile(fixture.commandPath, command),
+      writeFile(
+        join(unverifiedPackage, "package.json"),
+        JSON.stringify({
+          name: "unverified-node-path-package",
+          main: "index.js",
+        }),
+      ),
+      writeFile(
+        join(unverifiedPackage, "index.js"),
+        'module.exports = "unverified-node-path";',
+      ),
+    ]);
+    const installation = await verifyQualifiedAcpxInstallation(
+      {
+        ...fixture.profile,
+        commandDigest: `sha256:${createHash("sha256").update(command).digest("hex")}`,
+      },
+      fixture.resolve,
+    );
+
+    const previousNodePath = process.env.NODE_PATH;
+    let inheritedChild: ChildProcess;
+    try {
+      process.env.NODE_PATH = dirname(unverifiedPackage);
+      inheritedChild = (await installation.openCommand()).spawn();
+    } finally {
+      if (previousNodePath === undefined) delete process.env.NODE_PATH;
+      else process.env.NODE_PATH = previousNodePath;
+    }
+    const expectedFailure =
+      process.platform === "linux"
+        ? "unverified-node-path-package"
+        : "requires Linux descriptor-pinned paths";
+    await expectFailure(inheritedChild, expectedFailure);
+
+    await expectFailure(
+      (await installation.openCommand()).spawn([], {
+        env: {
+          ...process.env,
+          NODE_PATH: dirname(unverifiedPackage),
+          node_path: dirname(unverifiedPackage),
+        },
+      }),
+      expectedFailure,
     );
   });
 

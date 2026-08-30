@@ -170,9 +170,8 @@ export async function verifyQualifiedAcpxInstallation(
       }
       let currentDependencyAncestors: FileHandle[] = [];
       try {
-        currentDependencyAncestors = await openDependencyAncestors(
-          dependencyAncestors,
-        );
+        currentDependencyAncestors =
+          await openDependencyAncestors(dependencyAncestors);
         const current = await inspectCommand(
           commandPath,
           commandDigest,
@@ -512,6 +511,9 @@ function commandLease(
         child = spawnChildProcess(
           process.execPath,
           [
+            // Keep resolved module URLs on the retained descriptor paths so
+            // the hook can distinguish them from ordinary host ancestry.
+            "--preserve-symlinks",
             "--eval",
             format === "module"
               ? MODULE_SNAPSHOT_BOOTSTRAP
@@ -558,15 +560,18 @@ function commandLease(
   };
 }
 
-function sanitizedNodeEnvironment(
+export function sanitizedNodeEnvironment(
   environment: NodeJS.ProcessEnv | undefined,
 ): NodeJS.ProcessEnv {
   const sanitized = { ...(environment ?? process.env) };
   for (const key of Object.keys(sanitized)) {
     // Environment keys are case-insensitive on Windows. Dropping every case
-    // variant also keeps a context portable instead of admitting a preload on
-    // one runner host and rejecting it on another.
-    if (key.toUpperCase() === "NODE_OPTIONS") delete sanitized[key];
+    // variant also keeps a context portable instead of admitting a preload or
+    // an unverified package-search root on one runner host but not another.
+    const normalizedKey = key.toUpperCase();
+    if (normalizedKey === "NODE_OPTIONS" || normalizedKey === "NODE_PATH") {
+      delete sanitized[key];
+    }
   }
   return sanitized;
 }
@@ -590,8 +595,10 @@ function snapshotBootstrap(format: AcpxCommandFormat): string {
     `const dependencyDirectoryUrls = Array.from({ length: dependencyAncestorCount }, (_, index) => pathToFileURL("/proc/self/fd/" + (${DEPENDENCY_ANCESTOR_FD_START} + index) + "/").href);`,
     "const target = pathToFileURL(commandPath).href;",
     "const dependencyAncestorByUrl = new Map([[target, 0]]);",
-    "const dependencyAncestorIndex = (url) => { const recorded = dependencyAncestorByUrl.get(url); if (recorded !== undefined) return recorded; return dependencyDirectoryUrls.findIndex((dependencyDirectoryUrl) => url?.startsWith(dependencyDirectoryUrl) === true); };",
-    "const rememberDependencyAncestor = (resolution, fallbackIndex) => { const resolvedIndex = dependencyAncestorIndex(resolution?.url); const index = resolvedIndex < 0 ? fallbackIndex : resolvedIndex; if (index >= 0 && typeof resolution?.url === \"string\") dependencyAncestorByUrl.set(resolution.url, index); return resolution; };",
+    `const snapshotDescriptorAncestorIndex = ${snapshotDescriptorAncestorIndex.toString()};`,
+    "const dependencyAncestorIndex = (url) => { const recorded = dependencyAncestorByUrl.get(url); return recorded === undefined ? snapshotDescriptorAncestorIndex(url, directoryUrl, dependencyDirectoryUrls) : recorded; };",
+    `const guardSnapshotModuleResolution = ${guardSnapshotModuleResolution.toString()};`,
+    'const rememberDependencyAncestor = (specifier, resolution) => { const resolvedIndex = dependencyAncestorIndex(resolution?.url); guardSnapshotModuleResolution(isBuiltin(specifier), resolution?.url, resolvedIndex >= 0); if (resolvedIndex >= 0 && typeof resolution?.url === "string") dependencyAncestorByUrl.set(resolution.url, resolvedIndex); return resolution; };',
     `const source = fs.readFileSync(${COMMAND_SOURCE_FD});`,
     "registerHooks({ resolve(specifier, context, nextResolve) {",
     "if (specifier === target) return { url: target, shortCircuit: true };",
@@ -601,16 +608,17 @@ function snapshotBootstrap(format: AcpxCommandFormat): string {
     "const pinnedSpecifier = entryRelative ? new URL(specifier, pinnedTarget) : null;",
     'const lookupSpecifier = pinnedSpecifier === null ? specifier : context.conditions?.includes("require") ? fileURLToPath(pinnedSpecifier) : pinnedSpecifier.href;',
     "const snapshotImport = entryImport || context.parentURL?.startsWith(directoryUrl) === true || dependencyDirectoryUrls.some((dependencyDirectoryUrl) => context.parentURL?.startsWith(dependencyDirectoryUrl) === true);",
+    'const bareImport = snapshotImport && !isBuiltin(specifier) && !specifier.startsWith("./") && !specifier.startsWith("../") && !specifier.startsWith("/") && !specifier.includes(":");',
     "const filesystemLookup = snapshotImport && !isBuiltin(specifier);",
     "const lookupContext = entryImport && pinnedSpecifier === null && !isBuiltin(specifier) ? { ...context, parentURL: pinnedTarget } : context;",
     "return guardSnapshotModuleLookup(process.platform, filesystemLookup, () => {",
-    "try { return rememberDependencyAncestor(nextResolve(lookupSpecifier, lookupContext), parentDependencyAncestorIndex); } catch (error) {",
-    'if (!snapshotImport || pinnedSpecifier !== null || isBuiltin(specifier) || error?.code !== "ERR_MODULE_NOT_FOUND") throw error;',
+    "try { return rememberDependencyAncestor(specifier, nextResolve(lookupSpecifier, lookupContext)); } catch (error) {",
+    'if (!bareImport || (error?.code !== "ERR_MODULE_NOT_FOUND" && error?.code !== "ERR_ACPX_UNVERIFIED_MODULE")) throw error;',
     "let dependencyError = error;",
     "for (let dependencyIndex = Math.max(0, parentDependencyAncestorIndex); dependencyIndex < dependencyDirectoryUrls.length; dependencyIndex += 1) {",
     "const dependencyDirectoryUrl = dependencyDirectoryUrls[dependencyIndex];",
-    'try { return rememberDependencyAncestor(nextResolve(specifier, { ...context, parentURL: new URL("package.json", dependencyDirectoryUrl).href }), dependencyIndex); } catch (candidateError) {',
-    'if (candidateError?.code !== "ERR_MODULE_NOT_FOUND") throw candidateError;',
+    'try { return rememberDependencyAncestor(specifier, nextResolve(specifier, { ...context, parentURL: new URL("package.json", dependencyDirectoryUrl).href })); } catch (candidateError) {',
+    'if (candidateError?.code !== "ERR_MODULE_NOT_FOUND" && candidateError?.code !== "ERR_ACPX_UNVERIFIED_MODULE") throw candidateError;',
     "dependencyError = candidateError;",
     "}",
     "}",
@@ -620,6 +628,7 @@ function snapshotBootstrap(format: AcpxCommandFormat): string {
     "}, load(url, context, nextLoad) {",
     `if (url === target) return { format: ${JSON.stringify(format)}, source, shortCircuit: true };`,
     "const descriptorLookup = url.startsWith(directoryUrl) || dependencyDirectoryUrls.some((dependencyDirectoryUrl) => url.startsWith(dependencyDirectoryUrl));",
+    "guardSnapshotModuleResolution(false, url, descriptorLookup);",
     "return guardSnapshotModuleLookup(process.platform, descriptorLookup, () => nextLoad(url, context));",
     "} });",
     "import(target).catch((error) => { console.error(error); process.exitCode = 1; });",
@@ -637,6 +646,39 @@ export function guardSnapshotModuleLookup<T>(
     );
   }
   return lookup();
+}
+
+/** Refuse filesystem modules that are not reached through a retained directory. */
+export function guardSnapshotModuleResolution(
+  builtin: boolean,
+  resolvedUrl: unknown,
+  descriptorAuthorized: boolean,
+): void {
+  if (
+    !builtin &&
+    typeof resolvedUrl === "string" &&
+    resolvedUrl.startsWith("file:") &&
+    !descriptorAuthorized
+  ) {
+    const error = new Error(
+      "ACPX provider module escaped descriptor-pinned ancestry",
+    );
+    Object.assign(error, { code: "ERR_ACPX_UNVERIFIED_MODULE" });
+    throw error;
+  }
+}
+
+/** Locate a module URL within the command directory or retained ancestry. */
+export function snapshotDescriptorAncestorIndex(
+  resolvedUrl: unknown,
+  commandDirectoryUrl: string,
+  dependencyDirectoryUrls: readonly string[],
+): number {
+  if (typeof resolvedUrl !== "string") return -1;
+  if (resolvedUrl.startsWith(commandDirectoryUrl)) return 0;
+  return dependencyDirectoryUrls.findIndex((dependencyDirectoryUrl) =>
+    resolvedUrl.startsWith(dependencyDirectoryUrl),
+  );
 }
 
 function executableFormat(
