@@ -20,6 +20,7 @@ import { isAbsolute, join, resolve } from "node:path";
 const MAX_CODEX_CREDENTIAL_BYTES = 256 * 1024;
 const PRIVATE_FILE_MODE = 0o600;
 const MAX_DIRECTORY_SYNC_ATTEMPTS = 8;
+const DIRECTORY_SYNC_OPERATION_TIMEOUT_MS = 1_000;
 const MAX_AUTONOMOUS_CREDENTIAL_CLEANUP_ATTEMPTS = 8;
 const CREDENTIAL_CLEANUP_INTENT = ".paperclip-auth-cleanup-required";
 const CREDENTIAL_LEASE_HOST = "127.0.0.1";
@@ -1065,14 +1066,75 @@ async function syncDirectoryDurably(directory: string): Promise<void> {
 
 async function syncDirectory(directory: string): Promise<void> {
   if (process.platform === "win32") return;
-  const handle = await open(
+  const openAttempt = open(
     directory,
     constants.O_RDONLY | (constants.O_DIRECTORY ?? 0),
   );
+  let handle: FileHandle;
   try {
-    await handle.sync();
+    handle = await waitForDirectorySyncOperation(
+      openAttempt,
+      "open",
+      directory,
+    );
+  } catch (error) {
+    if (error instanceof DirectorySyncOperationTimeoutError) {
+      // open(2) cannot be cancelled. If the kernel eventually returns a
+      // handle after our retry budget has advanced, close it without keeping
+      // credential admission or cleanup pending.
+      void openAttempt
+        .then((lateHandle) => lateHandle.close())
+        .catch(() => undefined);
+    }
+    throw error;
+  }
+
+  const syncAttempt = handle.sync();
+  let syncTimedOut = false;
+  try {
+    await waitForDirectorySyncOperation(syncAttempt, "fsync", directory);
+  } catch (error) {
+    syncTimedOut = error instanceof DirectorySyncOperationTimeoutError;
+    if (syncTimedOut) {
+      // FileHandle.close() waits for outstanding operations. Detach cleanup
+      // from a timed-out fsync so the durable retry loop remains bounded.
+      void syncAttempt
+        .finally(() => handle.close())
+        .catch(() => undefined);
+    }
+    throw error;
   } finally {
-    await handle.close();
+    if (!syncTimedOut) await handle.close();
+  }
+}
+
+class DirectorySyncOperationTimeoutError extends Error {
+  constructor(operation: "open" | "fsync", directory: string) {
+    super(
+      `Managed Codex credential directory ${operation} timed out after ${DIRECTORY_SYNC_OPERATION_TIMEOUT_MS}ms for ${directory}`,
+    );
+    this.name = "DirectorySyncOperationTimeoutError";
+  }
+}
+
+async function waitForDirectorySyncOperation<T>(
+  operationAttempt: Promise<T>,
+  operation: "open" | "fsync",
+  directory: string,
+): Promise<T> {
+  let timeout: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      operationAttempt,
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => {
+          reject(new DirectorySyncOperationTimeoutError(operation, directory));
+        }, DIRECTORY_SYNC_OPERATION_TIMEOUT_MS);
+        timeout.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
   }
 }
 

@@ -24,6 +24,9 @@ import { stageManagedCodexCredential } from "./codex-credentials.js";
 const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
+  vi.useRealTimers();
+  vi.doUnmock("node:fs/promises");
+  vi.resetModules();
   await Promise.all(
     temporaryDirectories
       .splice(0)
@@ -633,6 +636,100 @@ describe("managed Codex credentials", () => {
       } finally {
         syncSpy.mockRestore();
       }
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "bounds a directory open that never settles",
+    async () => {
+      const fixture = await credentialFixture();
+      const actualFs = await vi.importActual<typeof import("node:fs/promises")>(
+        "node:fs/promises",
+      );
+      let directoryOpenAttempts = 0;
+      let observeFirstOpen!: () => void;
+      const firstOpen = new Promise<void>((resolveOpen) => {
+        observeFirstOpen = resolveOpen;
+      });
+      vi.doMock("node:fs/promises", () => ({
+        ...actualFs,
+        open: async (
+          path: Parameters<typeof open>[0],
+          flags: Parameters<typeof open>[1],
+          mode?: Parameters<typeof open>[2],
+        ): Promise<FileHandle> => {
+          if (String(path) === fixture.home) {
+            directoryOpenAttempts += 1;
+            observeFirstOpen();
+            return await new Promise<FileHandle>(() => undefined);
+          }
+          return await actualFs.open(path, flags, mode);
+        },
+      }));
+      vi.resetModules();
+      const freshCredentials = await import("./codex-credentials.js");
+      vi.useFakeTimers();
+
+      const staging = freshCredentials.stageManagedCodexCredential({
+        agentHomeDirectory: fixture.home,
+        environment: { OPENAI_API_KEY: "launch-only-key" },
+      });
+      const rejection = expect(staging).rejects.toThrow(
+        "remained non-durable after 8 attempts",
+      );
+      await firstOpen;
+      await vi.advanceTimersByTimeAsync(20_000);
+      await rejection;
+      expect(directoryOpenAttempts).toBe(8);
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "bounds a directory fsync that never settles",
+    async () => {
+      const fixture = await credentialFixture();
+      const actualFs = await vi.importActual<typeof import("node:fs/promises")>(
+        "node:fs/promises",
+      );
+      let directorySyncAttempts = 0;
+      let observeFirstSync!: () => void;
+      const firstSync = new Promise<void>((resolveSync) => {
+        observeFirstSync = resolveSync;
+      });
+      const stalledDirectoryHandle = {
+        close: async (): Promise<void> => undefined,
+        sync: async (): Promise<void> => {
+          directorySyncAttempts += 1;
+          observeFirstSync();
+          return await new Promise<void>(() => undefined);
+        },
+      } as FileHandle;
+      vi.doMock("node:fs/promises", () => ({
+        ...actualFs,
+        open: async (
+          path: Parameters<typeof open>[0],
+          flags: Parameters<typeof open>[1],
+          mode?: Parameters<typeof open>[2],
+        ): Promise<FileHandle> => {
+          if (String(path) === fixture.home) return stalledDirectoryHandle;
+          return await actualFs.open(path, flags, mode);
+        },
+      }));
+      vi.resetModules();
+      const freshCredentials = await import("./codex-credentials.js");
+      vi.useFakeTimers();
+
+      const staging = freshCredentials.stageManagedCodexCredential({
+        agentHomeDirectory: fixture.home,
+        environment: { OPENAI_API_KEY: "launch-only-key" },
+      });
+      const rejection = expect(staging).rejects.toThrow(
+        "remained non-durable after 8 attempts",
+      );
+      await firstSync;
+      await vi.advanceTimersByTimeAsync(20_000);
+      await rejection;
+      expect(directorySyncAttempts).toBe(8);
     },
   );
 
