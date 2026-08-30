@@ -94,6 +94,32 @@ fn finish_turn(state_path: &Path, state: &mut FakeState, status: &str) -> io::Re
     save_state(state_path, state)
 }
 
+fn emit_ambiguous_turn_evidence(
+    state_path: &Path,
+    state: &mut FakeState,
+    emit_turn_started: bool,
+    conflicting_identity: bool,
+) -> io::Result<()> {
+    let turn_id = state
+        .active_turn_id
+        .clone()
+        .unwrap_or_else(|| "provider-turn-2".to_owned());
+    if emit_turn_started {
+        send(json!({
+            "method": "turn/started",
+            "params": {"turn": {"id": turn_id}}
+        }))?;
+    }
+    if conflicting_identity {
+        send(json!({
+            "method": "turn/completed",
+            "params": {"turn": {"id": "provider-turn-conflict", "status": "completed"}}
+        }))
+    } else {
+        finish_turn(state_path, state, "completed")
+    }
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let state_path =
@@ -137,6 +163,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let fail_after_accepting_second_turn_before_response = args
         .iter()
         .any(|value| value == "--fail-after-accepting-second-turn-before-response");
+    let complete_ambiguous_second_turn = args
+        .iter()
+        .any(|value| value == "--complete-ambiguous-second-turn");
+    let conflicting_ambiguous_second_turn = args
+        .iter()
+        .any(|value| value == "--conflicting-ambiguous-second-turn");
+    let omit_ambiguous_turn_started = args
+        .iter()
+        .any(|value| value == "--omit-ambiguous-turn-started");
     let fail_after_thread_read = args.iter().any(|value| value == "--fail-after-thread-read");
     let exit_after_thread_read = args.iter().any(|value| value == "--exit-after-thread-read");
     let fail_after_turn_completion_delay_ms =
@@ -251,13 +286,36 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }))?;
                     return Err("configured failure after second turn rejection".into());
                 }
-                state.active_turn_id = Some("provider-turn-1".to_owned());
+                let emits_ambiguous_turn_evidence = turn_start_count == 2
+                    && (complete_ambiguous_second_turn || conflicting_ambiguous_second_turn);
+                let provider_turn_id = if emits_ambiguous_turn_evidence {
+                    "provider-turn-2"
+                } else {
+                    "provider-turn-1"
+                };
+                state.active_turn_id = Some(provider_turn_id.to_owned());
                 save_state(&state_path, &state)?;
                 if fail_after_accepting_second_turn_before_response && turn_start_count == 2 {
+                    if emits_ambiguous_turn_evidence {
+                        emit_ambiguous_turn_evidence(
+                            &state_path,
+                            &mut state,
+                            !omit_ambiguous_turn_started,
+                            conflicting_ambiguous_second_turn,
+                        )?;
+                    }
                     return Err("configured failure after accepting second turn".into());
                 }
                 if malformed_error_second_turn_start && turn_start_count == 2 {
                     send(json!({"id": id, "error": {}}))?;
+                    if emits_ambiguous_turn_evidence {
+                        emit_ambiguous_turn_evidence(
+                            &state_path,
+                            &mut state,
+                            !omit_ambiguous_turn_started,
+                            conflicting_ambiguous_second_turn,
+                        )?;
+                    }
                     return Err("configured failure after malformed turn error".into());
                 }
                 if missing_id_second_turn_start && turn_start_count == 2 {
@@ -265,6 +323,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         "id": id,
                         "result": {"turn": {"status": "inProgress"}}
                     }))?;
+                    if emits_ambiguous_turn_evidence {
+                        emit_ambiguous_turn_evidence(
+                            &state_path,
+                            &mut state,
+                            !omit_ambiguous_turn_started,
+                            conflicting_ambiguous_second_turn,
+                        )?;
+                    }
                     return Err("configured failure after missing turn identity".into());
                 }
                 send(json!({

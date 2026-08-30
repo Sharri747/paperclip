@@ -850,6 +850,14 @@ impl CodexCommandExecutor {
                     )));
                 }
                 CodexProviderEvent::Notification { method, params } => {
+                    let active_provider_turn_id = if method == "turn/started" {
+                        self.provider
+                            .as_ref()
+                            .and_then(CodexProvider::active_provider_turn_id)
+                            .map(str::to_owned)
+                    } else {
+                        None
+                    };
                     let completed_turn_authority = if method == "turn/completed" {
                         self.provider
                             .as_ref()
@@ -885,6 +893,14 @@ impl CodexCommandExecutor {
                                 .filter(|text| !text.is_empty())
                                 .map(|text| text.chars().take(1_000_000).collect());
                         }
+                    }
+                    if method == "turn/started" {
+                        let provider_turn_id = active_provider_turn_id.ok_or_else(|| {
+                            DurableRunnerError::invalid(
+                                "Codex turn start notification omitted active turn authority",
+                            )
+                        })?;
+                        state.reconcile_active_provider_turn(Some(provider_turn_id));
                     }
                     if method == "turn/completed" {
                         let (process_generation, provider_turn_id) = completed_turn_authority

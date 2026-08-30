@@ -748,6 +748,174 @@ fn ambiguous_replacement_turn_start_preserves_prior_result_without_reconciling_e
 }
 
 #[test]
+fn ambiguous_replacement_turn_adopts_one_later_completion_identity() {
+    for (label, switch, omit_started) in [
+        (
+            "accepted-before-response-with-completion",
+            "--fail-after-accepting-second-turn-before-response",
+            false,
+        ),
+        (
+            "malformed-error-with-completion",
+            "--malformed-error-second-turn-start",
+            false,
+        ),
+        (
+            "missing-turn-id-with-completion",
+            "--missing-id-second-turn-start",
+            true,
+        ),
+    ] {
+        let directory = temporary_directory(label);
+        let mut switches = vec![switch, "--complete-ambiguous-second-turn"];
+        if omit_started {
+            switches.push("--omit-ambiguous-turn-started");
+        }
+        let config = provider_config(&directory, &switches);
+        let mut provider = CodexProvider::start(&config, None).expect("start Codex provider");
+        provider
+            .start_turn("Complete the first turn.", &config.cwd)
+            .expect("start first provider turn");
+        let first_completed = (0..32).any(|_| {
+            matches!(
+                provider.poll().expect("poll first turn"),
+                Some(CodexProviderEvent::Notification { method, .. })
+                    if method == "turn/completed"
+            )
+        });
+        assert!(
+            first_completed,
+            "observe the authoritative first completion for {label}"
+        );
+
+        provider
+            .start_turn("Complete accepted replacement work.", &config.cwd)
+            .expect_err("the accepted replacement turn has no valid response");
+        let unresolved_error = provider
+            .start_turn("Do not start duplicate replacement work.", &config.cwd)
+            .expect_err("an unresolved ambiguous start bounds replacement work to one turn");
+        assert!(
+            unresolved_error
+                .to_string()
+                .contains("unresolved ambiguous provider turn start"),
+            "unexpected unresolved-start error for {label}: {unresolved_error}"
+        );
+
+        let mut replacement_started = false;
+        let mut replacement_completed = false;
+        let replacement_exit = (0..128).find_map(|_| {
+            match provider
+                .poll()
+                .expect("poll evidence for accepted replacement turn")
+            {
+                Some(CodexProviderEvent::Notification { method, params })
+                    if method == "turn/started" =>
+                {
+                    assert_eq!(
+                        params.pointer("/turn/id").and_then(Value::as_str),
+                        Some("provider-turn-2")
+                    );
+                    replacement_started = true;
+                    None
+                }
+                Some(CodexProviderEvent::Notification { method, params })
+                    if method == "turn/completed" =>
+                {
+                    assert_eq!(
+                        params.pointer("/turn/id").and_then(Value::as_str),
+                        Some("provider-turn-2")
+                    );
+                    replacement_completed = true;
+                    None
+                }
+                Some(CodexProviderEvent::Exited {
+                    success,
+                    completed_turn_authoritative,
+                    completion_reconciles_exit,
+                    ..
+                }) => Some((
+                    success,
+                    completed_turn_authoritative,
+                    completion_reconciles_exit,
+                )),
+                _ => None,
+            }
+        });
+        assert_eq!(
+            replacement_started, !omit_started,
+            "the replacement identity should be established by the expected notification for {label}"
+        );
+        assert!(
+            replacement_completed,
+            "observe replacement completion for {label}"
+        );
+        assert_eq!(
+            replacement_exit,
+            Some((false, true, true)),
+            "the replacement completion, not the old result, reconciles the provider exit for {label}"
+        );
+
+        fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
+    }
+}
+
+#[test]
+fn ambiguous_replacement_turn_rejects_conflicting_later_identity() {
+    let directory = temporary_directory("conflicting-ambiguous-turn-identities");
+    let config = provider_config(
+        &directory,
+        &[
+            "--missing-id-second-turn-start",
+            "--conflicting-ambiguous-second-turn",
+        ],
+    );
+    let mut provider = CodexProvider::start(&config, None).expect("start Codex provider");
+    provider
+        .start_turn("Complete the first turn.", &config.cwd)
+        .expect("start first provider turn");
+    let first_completed = (0..32).any(|_| {
+        matches!(
+            provider.poll().expect("poll first turn"),
+            Some(CodexProviderEvent::Notification { method, .. })
+                if method == "turn/completed"
+        )
+    });
+    assert!(
+        first_completed,
+        "observe the authoritative first completion"
+    );
+
+    provider
+        .start_turn("Accept replacement work ambiguously.", &config.cwd)
+        .expect_err("the replacement response omits its turn identity");
+    let replacement_started = provider
+        .poll()
+        .expect("poll replacement start")
+        .expect("replacement start is available");
+    assert!(matches!(
+        replacement_started,
+        CodexProviderEvent::Notification { method, params }
+            if method == "turn/started"
+                && params.pointer("/turn/id").and_then(Value::as_str)
+                    == Some("provider-turn-2")
+    ));
+    assert_eq!(provider.active_provider_turn_id(), Some("provider-turn-2"));
+
+    let conflicting_completion = provider
+        .poll()
+        .expect_err("a second replacement identity must fail closed");
+    assert!(
+        conflicting_completion
+            .to_string()
+            .contains("another active turn"),
+        "unexpected conflicting-identity error: {conflicting_completion}"
+    );
+    assert_eq!(provider.active_provider_turn_id(), Some("provider-turn-2"));
+
+    fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
+}
+
+#[test]
 fn ambiguous_replacement_start_preserves_durable_authority_before_exit() {
     let directory = temporary_directory("durable-ambiguous-turn-start");
     let config = provider_config(
@@ -825,6 +993,98 @@ fn ambiguous_replacement_start_preserves_durable_authority_before_exit() {
     assert!(!exit_events
         .iter()
         .any(|event| event == "session.reconciled"));
+
+    fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
+}
+
+#[test]
+fn ambiguous_replacement_completion_replaces_durable_turn_authority() {
+    let directory = temporary_directory("durable-ambiguous-turn-completion");
+    let config = provider_config(
+        &directory,
+        &[
+            "--missing-id-second-turn-start",
+            "--complete-ambiguous-second-turn",
+        ],
+    );
+    let mut executor = CodexCommandExecutor::new(&directory);
+    executor
+        .execute(&command(
+            "prepare",
+            1,
+            "run.prepare",
+            json!({"provider": config}),
+        ))
+        .expect("prepare Codex provider");
+    executor
+        .execute(&command("open", 2, "session.open", json!({})))
+        .expect("open Codex session");
+    executor
+        .execute(&command(
+            "first-turn",
+            3,
+            "turn.start",
+            json!({"text": "Complete the first turn."}),
+        ))
+        .expect("start first provider turn");
+
+    let mut first_events = Vec::new();
+    for _ in 0..32 {
+        first_events.extend(
+            poll_and_ack(&mut executor)
+                .expect("poll first turn")
+                .into_iter()
+                .map(|event| event.event_type),
+        );
+        if first_events.iter().any(|event| event == "turn.completed") {
+            break;
+        }
+    }
+    assert!(first_events.iter().any(|event| event == "turn.completed"));
+
+    executor
+        .execute(&command(
+            "ambiguous-turn",
+            4,
+            "turn.start",
+            json!({"text": "Complete replacement work after the malformed response."}),
+        ))
+        .expect_err("accepted replacement response omits its turn identity");
+
+    let mut replacement_events = Vec::new();
+    for _ in 0..64 {
+        replacement_events.extend(
+            poll_and_ack(&mut executor)
+                .expect("poll accepted replacement evidence")
+                .into_iter()
+                .map(|event| event.event_type),
+        );
+        if replacement_events
+            .iter()
+            .any(|event| event == "session.reconciled")
+        {
+            break;
+        }
+    }
+    assert!(replacement_events
+        .iter()
+        .any(|event| event == "turn.started"));
+    assert!(replacement_events
+        .iter()
+        .any(|event| event == "turn.completed"));
+    assert!(replacement_events
+        .iter()
+        .any(|event| event == "session.reconciled"));
+
+    let persisted: Value = serde_json::from_slice(
+        &fs::read(directory.join("codex-provider-state.json"))
+            .expect("read provider state after replacement completion"),
+    )
+    .expect("parse provider state after replacement completion");
+    assert_eq!(persisted["activeProviderTurnId"], Value::Null);
+    assert_eq!(persisted["completedTurnAuthoritative"], true);
+    assert_eq!(persisted["completedTurnProcessGeneration"], 1);
+    assert_eq!(persisted["completedProviderTurnId"], "provider-turn-2");
 
     fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
 }

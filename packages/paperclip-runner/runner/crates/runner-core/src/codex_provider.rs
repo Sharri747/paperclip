@@ -184,6 +184,7 @@ pub struct CodexProvider {
     process_generation: u64,
     completed_turn_authority: Option<CompletedTurnAuthority>,
     completion_reconciliation_pending: bool,
+    ambiguous_turn_start_pending: bool,
 }
 
 impl CodexProvider {
@@ -248,6 +249,7 @@ impl CodexProvider {
             process_generation,
             completed_turn_authority: None,
             completion_reconciliation_pending: false,
+            ambiguous_turn_start_pending: false,
         };
         let initialized = provider.request(
             "initialize",
@@ -366,6 +368,11 @@ impl CodexProvider {
                 "Codex already has an active provider turn",
             ));
         }
+        if self.ambiguous_turn_start_pending {
+            return Err(LocalRunnerError::invalid(
+                "Codex has an unresolved ambiguous provider turn start",
+            ));
+        }
         if message.is_empty() || message.len() > MAX_INSTRUCTIONS_BYTES {
             return Err(LocalRunnerError::invalid(
                 "Codex turn text is empty or exceeds the 1 MiB limit",
@@ -377,6 +384,7 @@ impl CodexProvider {
         let prior_reconciliation_pending = self.completion_reconciliation_pending;
         let prior_buffered_message_count = self.pending_messages.len();
         self.completion_reconciliation_pending = false;
+        self.ambiguous_turn_start_pending = true;
         let result = match self.request_classified(
             "turn/start",
             json!({
@@ -389,6 +397,7 @@ impl CodexProvider {
         ) {
             Ok(result) => result,
             Err(ProviderRequestError::Rejected(error)) => {
+                self.ambiguous_turn_start_pending = false;
                 // A definite rejection proves no replacement work began.
                 // Only diagnostics without provider-work identity belong to
                 // that rejected request. Contradictory turn/item evidence or
@@ -408,19 +417,65 @@ impl CodexProvider {
             }
             Err(ProviderRequestError::Ambiguous(error)) => return Err(error),
         };
-        let provider_turn_id = result
-            .pointer("/turn/id")
-            .or_else(|| result.get("turnId"))
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| LocalRunnerError::invalid("Codex turn/start omitted turn.id"))?
-            .to_owned();
+        let provider_turn_id = bounded_identifier(
+            result
+                .pointer("/turn/id")
+                .or_else(|| result.get("turnId"))
+                .and_then(Value::as_str),
+            "Codex turn id",
+        )?;
         // Only a validated provider turn identity proves that replacement
         // work exists and supersedes the prior completed result.
+        self.accept_replacement_turn(provider_turn_id);
+        Ok(result)
+    }
+
+    fn reconcile_ambiguous_turn_notification(
+        &mut self,
+        message: &Value,
+    ) -> Result<(), LocalRunnerError> {
+        if !self.ambiguous_turn_start_pending || message.get("id").is_some() {
+            return Ok(());
+        }
+
+        let Some(method) = message.get("method").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        if !matches!(method, "turn/started" | "turn/completed") {
+            return Ok(());
+        }
+
+        let params = message.get("params").cloned().unwrap_or(Value::Null);
+        validate_notification_binding(&self.thread_id, None, &params)?;
+        let provider_turn_id =
+            bounded_identifier(notification_turn_id(&params), "Codex turn id").map_err(
+                |_| {
+                    LocalRunnerError::invalid(format!(
+                        "Codex {method} notification cannot resolve an ambiguous turn start without a valid turn id"
+                    ))
+                },
+            )?;
+
+        if self
+            .completed_turn_authority
+            .as_ref()
+            .is_some_and(|authority| authority.provider_turn_id == provider_turn_id)
+        {
+            return Err(LocalRunnerError::invalid(format!(
+                "Codex {method} notification reused the previously completed turn id while resolving an ambiguous turn start"
+            )));
+        }
+
+        self.accept_replacement_turn(provider_turn_id);
+        Ok(())
+    }
+
+    fn accept_replacement_turn(&mut self, provider_turn_id: String) {
+        self.ambiguous_turn_start_pending = false;
         self.expected_shutdown = false;
         self.completed_turn_authority = None;
+        self.completion_reconciliation_pending = false;
         self.active_provider_turn_id = Some(provider_turn_id);
-        Ok(result)
     }
 
     pub fn steer_turn(&mut self, message: &str) -> Result<Value, LocalRunnerError> {
@@ -534,6 +589,8 @@ impl CodexProvider {
             };
             parse_provider_message(&line)?
         };
+
+        self.reconcile_ambiguous_turn_notification(&message)?;
 
         if revokes_completion_reconciliation
             && self.completed_turn_authority.is_some()
@@ -1022,11 +1079,7 @@ fn validate_notification_binding(
             "Codex notification named another thread",
         ));
     }
-    let notification_turn_id = params
-        .get("turnId")
-        .or_else(|| params.pointer("/turn/id"))
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty());
+    let notification_turn_id = notification_turn_id(params);
     if let Some(active_turn_id) = active_turn_id {
         if notification_turn_id.is_some_and(|value| value != active_turn_id) {
             return Err(LocalRunnerError::invalid(
@@ -1035,6 +1088,14 @@ fn validate_notification_binding(
         }
     }
     Ok(())
+}
+
+fn notification_turn_id(params: &Value) -> Option<&str> {
+    params
+        .get("turnId")
+        .or_else(|| params.pointer("/turn/id"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
 }
 
 fn latest_active_turn_id(snapshot: &Value) -> Option<String> {
