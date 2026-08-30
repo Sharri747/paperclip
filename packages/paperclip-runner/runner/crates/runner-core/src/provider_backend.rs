@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::codex_provider::{
-    CodexProvider, CodexProviderConfig, CodexProviderEvent, MAX_SETTLED_PROVIDER_TURN_IDS,
+    CodexProvider, CodexProviderConfig, CodexProviderEvent, RejectedAcceptedTurn,
+    MAX_SETTLED_PROVIDER_TURN_IDS,
 };
 use crate::durable::{
     create_private_temporary_file, current_unix_ms, open_private_regular_file, sanitize_value,
@@ -1282,7 +1283,7 @@ impl CodexCommandExecutor {
             start_result,
             completion_authority_retained,
             ambiguous_turn_start_pending,
-            rejected_accepted_turn_id,
+            rejected_accepted_turn,
         ) = {
             let provider = self.ensure_provider()?;
             let result = provider.start_turn(text, &cwd);
@@ -1290,12 +1291,12 @@ impl CodexCommandExecutor {
                 result,
                 provider.completed_turn_authority().is_some(),
                 provider.ambiguous_turn_start_pending(),
-                provider.take_rejected_accepted_provider_turn_id(),
+                provider.take_rejected_accepted_turn(),
             )
         };
         if let Err(error) = start_result {
-            if let Some(provider_turn_id) = rejected_accepted_turn_id {
-                // Codex accepted this work before disclosing a reused durable
+            if let Some(rejected_accepted_turn) = rejected_accepted_turn {
+                // Codex accepted this work before disclosing a usable durable
                 // identity. The provider has already been terminated; close
                 // this run before returning so recovery cannot resume the
                 // untracked turn from the provider's thread snapshot.
@@ -1321,16 +1322,29 @@ impl CodexCommandExecutor {
                     priority: EventPriority::P0,
                     payload: json!({
                         "provider": "codex",
-                        "code": "provider_turn_identity_reused",
-                        "providerTurnId": provider_turn_id,
-                        "message": "Codex accepted work with a previously settled turn identity; Paperclip terminated the provider and closed the durable run",
+                        "code": match &rejected_accepted_turn {
+                            RejectedAcceptedTurn::ReusedIdentity(_) => "provider_turn_identity_reused",
+                            RejectedAcceptedTurn::InvalidIdentity => "provider_turn_identity_invalid",
+                        },
+                        "providerTurnId": match &rejected_accepted_turn {
+                            RejectedAcceptedTurn::ReusedIdentity(provider_turn_id) => json!(provider_turn_id),
+                            RejectedAcceptedTurn::InvalidIdentity => Value::Null,
+                        },
+                        "message": match &rejected_accepted_turn {
+                            RejectedAcceptedTurn::ReusedIdentity(_) => "Codex accepted work with a previously settled turn identity; Paperclip terminated the provider and closed the durable run",
+                            RejectedAcceptedTurn::InvalidIdentity => "Codex accepted work without a valid bounded turn identity; Paperclip terminated the provider and closed the durable run",
+                        },
                         "paperclipAccepted": false,
                         "providerAccepted": true,
                     }),
                 })?;
                 self.save_state()?;
+                let failure_kind = match &rejected_accepted_turn {
+                    RejectedAcceptedTurn::ReusedIdentity(_) => "accepted identity reuse",
+                    RejectedAcceptedTurn::InvalidIdentity => "an invalid accepted identity",
+                };
                 return Err(DurableRunnerError::invalid(format!(
-                    "Codex turn/start failed closed after accepted identity reuse: {error}"
+                    "Codex turn/start failed closed after {failure_kind}: {error}"
                 )));
             }
             let state = self

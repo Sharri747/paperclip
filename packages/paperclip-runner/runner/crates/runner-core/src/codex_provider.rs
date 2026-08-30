@@ -193,6 +193,12 @@ enum ProviderRequestError {
     Ambiguous(LocalRunnerError),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RejectedAcceptedTurn {
+    ReusedIdentity(String),
+    InvalidIdentity,
+}
+
 impl ProviderRequestError {
     fn into_inner(self) -> LocalRunnerError {
         match self {
@@ -253,7 +259,7 @@ pub struct CodexProvider {
     completion_reconciliation_pending: bool,
     ambiguous_turn_start_pending: bool,
     settled_provider_turn_ids: SettledProviderTurnIds,
-    rejected_accepted_provider_turn_id: Option<String>,
+    rejected_accepted_turn: Option<RejectedAcceptedTurn>,
 }
 
 impl CodexProvider {
@@ -311,7 +317,7 @@ impl CodexProvider {
             completion_reconciliation_pending: false,
             ambiguous_turn_start_pending: false,
             settled_provider_turn_ids: SettledProviderTurnIds::default(),
-            rejected_accepted_provider_turn_id: None,
+            rejected_accepted_turn: None,
         };
         let initialized = provider.request(
             "initialize",
@@ -446,8 +452,8 @@ impl CodexProvider {
         self.settled_provider_turn_ids.limit_reached()
     }
 
-    pub(crate) fn take_rejected_accepted_provider_turn_id(&mut self) -> Option<String> {
-        self.rejected_accepted_provider_turn_id.take()
+    pub(crate) fn take_rejected_accepted_turn(&mut self) -> Option<RejectedAcceptedTurn> {
+        self.rejected_accepted_turn.take()
     }
 
     pub fn start_turn(&mut self, message: &str, cwd: &str) -> Result<Value, LocalRunnerError> {
@@ -517,20 +523,36 @@ impl CodexProvider {
             }
             Err(ProviderRequestError::Ambiguous(error)) => return Err(error),
         };
-        let provider_turn_id = bounded_identifier(
-            result
-                .pointer("/turn/id")
-                .or_else(|| result.get("turnId"))
-                .and_then(Value::as_str),
-            "Codex turn id",
-        )?;
+        let provider_turn_id = result
+            .pointer("/turn/id")
+            .or_else(|| result.get("turnId"))
+            .and_then(Value::as_str);
+        let provider_turn_id = match bounded_provider_turn_id(provider_turn_id) {
+            Ok(provider_turn_id) => provider_turn_id,
+            Err(error) => {
+                // A successful turn/start response means the provider may
+                // already be executing the work. Without a bounded identity,
+                // runnerd cannot durably bind, interrupt, or reconcile it.
+                // Terminate the process and let the durable backend close the
+                // run before returning the protocol error.
+                self.rejected_accepted_turn = Some(RejectedAcceptedTurn::InvalidIdentity);
+                self.expected_shutdown = true;
+                self.completed_turn_authority = None;
+                self.completion_reconciliation_pending = false;
+                let _ = self.cancel_pending_requests();
+                let _ = self.process.terminate_group();
+                return Err(error);
+            }
+        };
         if self.settled_provider_turn_ids.contains(&provider_turn_id) {
             // The provider accepted work before returning its identity. A
             // duplicate identity therefore cannot be handled as an ordinary
             // rejected request: terminate the process so the untracked turn
             // cannot continue mutating the workspace, and let the durable
             // backend close this run before reporting the error.
-            self.rejected_accepted_provider_turn_id = Some(provider_turn_id.clone());
+            self.rejected_accepted_turn = Some(RejectedAcceptedTurn::ReusedIdentity(
+                provider_turn_id.clone(),
+            ));
             self.expected_shutdown = true;
             self.completed_turn_authority = None;
             self.completion_reconciliation_pending = false;
@@ -1349,6 +1371,18 @@ fn bounded_identifier(value: Option<&str>, label: &str) -> Result<String, LocalR
     });
     if value.len() > 160 || !valid_first || !valid_rest {
         return Err(LocalRunnerError::invalid(format!("{label} is invalid")));
+    }
+    Ok(value.to_owned())
+}
+
+fn bounded_provider_turn_id(value: Option<&str>) -> Result<String, LocalRunnerError> {
+    let value = value
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| LocalRunnerError::invalid("Codex turn/start omitted turn.id"))?;
+    if value.len() > 240 || value.chars().any(char::is_control) {
+        return Err(LocalRunnerError::invalid(
+            "Codex turn/start returned an invalid turn.id",
+        ));
     }
     Ok(value.to_owned())
 }

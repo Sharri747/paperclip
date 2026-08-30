@@ -218,6 +218,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let missing_id_second_turn_start = args
         .iter()
         .any(|value| value == "--missing-id-second-turn-start");
+    let missing_id_live_turn_start = args
+        .iter()
+        .any(|value| value == "--missing-id-live-turn-start");
     let fail_after_accepting_second_turn_before_response = args
         .iter()
         .any(|value| value == "--fail-after-accepting-second-turn-before-response");
@@ -524,6 +527,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         )?;
                     }
                     return Err("configured failure after missing turn identity".into());
+                }
+                if missing_id_live_turn_start {
+                    send(json!({
+                        "id": id,
+                        "result": {"turn": {"status": "inProgress"}}
+                    }))?;
+                    continue;
                 }
                 send(json!({
                     "id": id,

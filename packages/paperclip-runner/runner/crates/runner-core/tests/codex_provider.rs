@@ -809,7 +809,6 @@ fn ambiguous_replacement_turn_start_preserves_prior_result_without_reconciling_e
             "--fail-after-accepting-second-turn-before-response",
         ),
         ("malformed-error", "--malformed-error-second-turn-start"),
-        ("missing-turn-id", "--missing-id-second-turn-start"),
     ] {
         let directory = temporary_directory(label);
         let config = provider_config(&directory, &[switch]);
@@ -858,6 +857,63 @@ fn ambiguous_replacement_turn_start_preserves_prior_result_without_reconciling_e
 
         fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
     }
+}
+
+#[test]
+fn durable_backend_closes_after_accepted_turn_omits_its_identity() {
+    let directory = temporary_directory("accepted-turn-missing-identity");
+    let config = provider_config(&directory, &["--missing-id-live-turn-start"]);
+    let runner_config = durable_config(&directory);
+    let mut executor = CodexCommandExecutor::with_runner_config(&directory, &runner_config);
+    executor
+        .execute(&command(
+            "prepare",
+            1,
+            "run.prepare",
+            json!({"provider": config}),
+        ))
+        .expect("prepare Codex provider");
+    executor
+        .execute(&command("open", 2, "session.open", json!({})))
+        .expect("open Codex session");
+
+    let error = executor
+        .execute(&command(
+            "turn-without-id",
+            3,
+            "turn.start",
+            json!({"text": "Accept work but omit its durable identity."}),
+        ))
+        .expect_err("accepted work without a turn identity must fail closed");
+    assert!(error.to_string().contains("omitted turn.id"));
+
+    let persisted: Value = serde_json::from_slice(
+        &fs::read(directory.join("codex-provider-state.json"))
+            .expect("read fail-closed provider state"),
+    )
+    .expect("parse fail-closed provider state");
+    assert_eq!(persisted["lifecycle"], "closed");
+    assert!(persisted["activeProviderTurnId"].is_null());
+
+    drop(executor);
+    let resumes_before_closed_restore = call_count(&directory, "thread/resume");
+    let mut closed = CodexCommandExecutor::with_runner_config(&directory, &runner_config);
+    let events = closed
+        .poll_events()
+        .expect("closed invalid-identity state remains readable without resuming Codex");
+    assert!(events.iter().any(|event| {
+        event.event_type == "harness.diagnostic"
+            && event.payload["code"] == "provider_turn_identity_invalid"
+            && event.payload["providerTurnId"].is_null()
+    }));
+    assert_eq!(
+        call_count(&directory, "thread/resume"),
+        resumes_before_closed_restore,
+        "recovery must not resume provider work accepted without a durable identity"
+    );
+
+    closed.shutdown().expect("close fail-closed executor");
+    fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
 }
 
 #[test]
