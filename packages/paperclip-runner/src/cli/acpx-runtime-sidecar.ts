@@ -22,7 +22,6 @@ import {
   type NormalizedAcpForm,
 } from "../drivers/acpx/acp-question-adapter.js";
 import { openCodexAcpxRuntime } from "../drivers/acpx/codex-runtime-adapter.js";
-import { createSanitizedAcpxEnvironment } from "../drivers/acpx/environment.js";
 import { resolveQualifiedAcpxProfile } from "../drivers/acpx/qualified-profiles.js";
 import {
   AcpxRuntimeHost,
@@ -213,7 +212,7 @@ async function dispatch(
         model: params.model,
         permissionMode: params.permissionMode,
         systemInstructions: params.systemInstructions,
-        environment: createSanitizedAcpxEnvironment(process.env, "codex"),
+        environment: process.env,
         expectedIdentity: params.expectedIdentity,
         semanticTools: {
           tools: params.tools,
