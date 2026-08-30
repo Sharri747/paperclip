@@ -14,6 +14,7 @@ use crate::provider_events::normalized_codex_terminal_event_type;
 
 pub const CODEX_APP_SERVER_MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const MAX_BUFFERED_MESSAGES: usize = 1_024;
+const MAX_BUFFERED_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_INSTRUCTIONS_BYTES: usize = 1024 * 1024;
 const MAX_PENDING_TOOL_REQUESTS: usize = 4_096;
 const MAX_PENDING_TOOL_REQUEST_BYTES: usize = 16 * 1024 * 1024;
@@ -246,6 +247,7 @@ pub struct CodexProvider {
     active_provider_turn_id: Option<String>,
     pending_messages: VecDeque<BufferedProviderMessage>,
     deferred_ambiguous_messages: VecDeque<BufferedProviderMessage>,
+    pending_message_bytes: usize,
     authorized_tool_ids: BTreeSet<String>,
     pending_tool_requests: BTreeMap<String, PendingToolRequest>,
     pending_tool_request_bytes: usize,
@@ -304,6 +306,7 @@ impl CodexProvider {
             active_provider_turn_id: None,
             pending_messages: VecDeque::new(),
             deferred_ambiguous_messages: VecDeque::new(),
+            pending_message_bytes: 0,
             authorized_tool_ids,
             pending_tool_requests: BTreeMap::new(),
             pending_tool_request_bytes: 0,
@@ -731,6 +734,12 @@ impl CodexProvider {
 
     pub fn poll(&mut self) -> Result<Option<CodexProviderEvent>, LocalRunnerError> {
         let buffered = self.pending_messages.pop_front();
+        if let Some(buffered) = buffered.as_ref() {
+            self.pending_message_bytes = self.pending_message_bytes.saturating_sub(json_size(
+                &buffered.value,
+                "buffered Codex provider message",
+            )?);
+        }
         let revokes_completion_reconciliation = buffered
             .as_ref()
             .map_or(true, |message| message.revokes_completion_reconciliation);
@@ -782,11 +791,26 @@ impl CodexProvider {
         match self.classify_ambiguous_turn_message(&message)? {
             AmbiguousTurnMessage::Ready => {}
             AmbiguousTurnMessage::Deferred => {
-                if self.deferred_ambiguous_messages.len() >= MAX_BUFFERED_MESSAGES {
+                if self
+                    .pending_messages
+                    .len()
+                    .saturating_add(self.deferred_ambiguous_messages.len())
+                    >= MAX_BUFFERED_MESSAGES
+                {
                     return Err(LocalRunnerError::invalid(
                         "Codex emitted too many messages before resolving an ambiguous turn start",
                     ));
                 }
+                let retained_bytes = json_size(&message, "buffered Codex provider message")?;
+                self.pending_message_bytes = retain_buffered_message_bytes(
+                    self.pending_message_bytes,
+                    retained_bytes,
+                )
+                .ok_or_else(|| {
+                    LocalRunnerError::invalid(
+                        "Codex buffered messages exceed the 16 MiB aggregate limit",
+                    )
+                })?;
                 self.deferred_ambiguous_messages
                     .push_back(BufferedProviderMessage {
                         value: message,
@@ -801,6 +825,16 @@ impl CodexProvider {
             }
             AmbiguousTurnMessage::ReconciledNeedsStart { provider_turn_id } => {
                 let mut replay = std::mem::take(&mut self.deferred_ambiguous_messages);
+                let retained_bytes = json_size(&message, "buffered Codex provider message")?;
+                self.pending_message_bytes = retain_buffered_message_bytes(
+                    self.pending_message_bytes,
+                    retained_bytes,
+                )
+                .ok_or_else(|| {
+                    LocalRunnerError::invalid(
+                        "Codex buffered messages exceed the 16 MiB aggregate limit",
+                    )
+                })?;
                 replay.push_back(BufferedProviderMessage {
                     value: message,
                     revokes_completion_reconciliation,
@@ -1225,17 +1259,44 @@ impl CodexProvider {
                 }
                 return Ok(message.get("result").cloned().unwrap_or(Value::Null));
             }
-            if self.pending_messages.len() >= MAX_BUFFERED_MESSAGES {
+            if self
+                .pending_messages
+                .len()
+                .saturating_add(self.deferred_ambiguous_messages.len())
+                >= MAX_BUFFERED_MESSAGES
+            {
                 return Err(ProviderRequestError::Ambiguous(LocalRunnerError::invalid(
                     "Codex emitted too many messages before a request response",
                 )));
             }
+            let retained_bytes = json_size(&message, "buffered Codex provider message")
+                .map_err(ProviderRequestError::Ambiguous)?;
+            let next_retained_bytes =
+                retain_buffered_message_bytes(self.pending_message_bytes, retained_bytes)
+                    .ok_or_else(|| {
+                        ProviderRequestError::Ambiguous(LocalRunnerError::invalid(
+                            "Codex buffered messages exceed the 16 MiB aggregate limit",
+                        ))
+                    })?;
             self.pending_messages.push_back(BufferedProviderMessage {
                 value: message,
                 revokes_completion_reconciliation: true,
             });
+            self.pending_message_bytes = next_retained_bytes;
         }
     }
+}
+
+fn json_size(value: &Value, label: &str) -> Result<usize, LocalRunnerError> {
+    serde_json::to_vec(value)
+        .map(|bytes| bytes.len())
+        .map_err(|error| LocalRunnerError::invalid(format!("{label} is not serializable: {error}")))
+}
+
+fn retain_buffered_message_bytes(current: usize, incoming: usize) -> Option<usize> {
+    current
+        .checked_add(incoming)
+        .filter(|total| *total <= MAX_BUFFERED_MESSAGE_BYTES)
 }
 
 fn pending_tool_request_size(
@@ -1964,5 +2025,18 @@ mod tests {
             None
         );
         assert_eq!(retain_pending_runtime_request_bytes(usize::MAX, 1), None);
+    }
+
+    #[test]
+    fn bounds_messages_buffered_while_waiting_for_a_response() {
+        assert_eq!(
+            retain_buffered_message_bytes(MAX_BUFFERED_MESSAGE_BYTES - 10, 10),
+            Some(MAX_BUFFERED_MESSAGE_BYTES)
+        );
+        assert_eq!(
+            retain_buffered_message_bytes(MAX_BUFFERED_MESSAGE_BYTES, 1),
+            None
+        );
+        assert_eq!(retain_buffered_message_bytes(usize::MAX, 1), None);
     }
 }
