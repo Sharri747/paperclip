@@ -54,6 +54,20 @@ describe("ACPX runtime sandbox", () => {
       expect(sandbox.launchEnvironment[credentialName]).toBe("provider-secret");
       expect(sandbox.launchEnvironment.HTTPS_PROXY).toContain("proxy-password");
       expect(sandbox.launchEnvironment.UNRELATED_SECRET).toBeUndefined();
+      expect(
+        sandbox.launchEnvironment.PAPERCLIP_NATIVE_MCP_TOKEN,
+      ).toBeUndefined();
+      expect(sandbox.launchEnvironment.HOME).toBe(sandbox.homeDirectory);
+      expect(sandbox.launchEnvironment.XDG_CONFIG_HOME).toBe(
+        sandbox.configDirectory,
+      );
+      expect(sandbox.launchEnvironment.XDG_DATA_HOME).toBe(
+        sandbox.dataDirectory,
+      );
+      expect(sandbox.launchEnvironment.XDG_CACHE_HOME).toBe(
+        sandbox.cacheDirectory,
+      );
+      expect(Object.isFrozen(sandbox.launchEnvironment)).toBe(true);
       expect(sandbox.persistedEnvironment[credentialName]).toBeUndefined();
       expect(sandbox.persistedEnvironment.HTTPS_PROXY).toBeUndefined();
       expect(

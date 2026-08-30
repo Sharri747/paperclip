@@ -18,7 +18,7 @@ import {
   resolve,
 } from "node:path";
 
-import { createSanitizedAcpxEnvironment } from "./environment.js";
+import { createSanitizedAcpxSpawnInput } from "./environment.js";
 import type { QualifiedAcpxAgent } from "./qualified-profiles.js";
 import type { AcpxRecoveryBinding } from "./recovery-identity.js";
 
@@ -97,10 +97,16 @@ export async function prepareAcpxRuntimeSandbox(input: {
     );
   }
 
-  const launchEnvironment = createSanitizedAcpxEnvironment(
+  const sanitizedSpawnInput = createSanitizedAcpxSpawnInput(
     input.environment,
     input.agent,
   );
+  // The sanitizer deliberately returns an opaque, frozen launch boundary.
+  // Build the sandbox-owned mutable copy only from that projected environment
+  // before adding paths that were created and validated above.
+  const launchEnvironment: NodeJS.ProcessEnv = {
+    ...sanitizedSpawnInput.env,
+  };
   Object.assign(launchEnvironment, {
     HOME: homeDirectory,
     XDG_CONFIG_HOME: configDirectory,
