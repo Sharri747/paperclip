@@ -43,6 +43,7 @@ const OWNER_FD = ${DEPENDENCY_ANCESTOR_FD_START} + dependencyAncestorCount;
 const OWNERSHIP_FD = OWNER_FD + 1;
 const CREDENTIAL_FENCE_FD = OWNERSHIP_FD + 1;
 const dependencyAncestorFds = Array.from({ length: dependencyAncestorCount }, (_, index) => ${DEPENDENCY_ANCESTOR_FD_START} + index);
+const PROVIDER_GUARDIAN_FD = ${DEPENDENCY_ANCESTOR_FD_START} + dependencyAncestorCount;
 let provider;
 let reaped = false;
 let shutdownStarted = false;
@@ -76,13 +77,16 @@ process.on("SIGHUP", shutdown);
 try {
   provider = spawn(
     process.execPath,
-    ["--eval", process.argv[1], ...process.argv.slice(2)],
+    ["--eval", process.argv[1], ...process.argv.slice(2, 5), String(process.pid), ...process.argv.slice(5)],
     {
       cwd: process.cwd(),
       detached: false,
       env: process.env,
       shell: false,
-      stdio: [0, 1, 2, ${COMMAND_SOURCE_FD}, ${COMMAND_DIRECTORY_FD}, ...dependencyAncestorFds],
+      // The provider observes this guardian-owned pipe directly. Kernel EOF
+      // therefore revokes it even when SIGKILL/OOM prevents our JS reap path.
+      // It also inherits the credential fence until that self-reap completes.
+      stdio: [0, 1, 2, ${COMMAND_SOURCE_FD}, ${COMMAND_DIRECTORY_FD}, ...dependencyAncestorFds, "pipe", CREDENTIAL_FENCE_FD],
       windowsHide: true,
     },
   );
@@ -156,6 +160,11 @@ type AcpxCommandFormat = "commonjs" | "module";
 
 const COMMONJS_SNAPSHOT_BOOTSTRAP = snapshotBootstrap("commonjs");
 const MODULE_SNAPSHOT_BOOTSTRAP = snapshotBootstrap("module");
+const GUARDED_COMMONJS_SNAPSHOT_BOOTSTRAP = snapshotBootstrap(
+  "commonjs",
+  true,
+);
+const GUARDED_MODULE_SNAPSHOT_BOOTSTRAP = snapshotBootstrap("module", true);
 
 /** Resolve and verify every installed artifact bound by a qualified profile. */
 export async function verifyQualifiedAcpxInstallation(
@@ -593,11 +602,14 @@ function commandLease(
       consumed = true;
       let child: ChildProcess;
       try {
-        const providerBootstrap =
-          format === "module"
+        const guarded = lifetime !== undefined;
+        const providerBootstrap = guarded
+          ? format === "module"
+            ? GUARDED_MODULE_SNAPSHOT_BOOTSTRAP
+            : GUARDED_COMMONJS_SNAPSHOT_BOOTSTRAP
+          : format === "module"
             ? MODULE_SNAPSHOT_BOOTSTRAP
             : COMMONJS_SNAPSHOT_BOOTSTRAP;
-        const guarded = lifetime !== undefined;
         const providerOwnershipFd =
           DEPENDENCY_ANCESTOR_FD_START + dependencyAncestors.length + 1;
         if (
@@ -798,7 +810,7 @@ export function sanitizedNodeEnvironment(
   return sanitized;
 }
 
-function snapshotBootstrap(format: AcpxCommandFormat): string {
+function snapshotBootstrap(format: AcpxCommandFormat, guarded = false): string {
   return [
     'const fs = require("node:fs");',
     'const { isBuiltin, registerHooks } = require("node:module");',
@@ -808,8 +820,22 @@ function snapshotBootstrap(format: AcpxCommandFormat): string {
     "const commandName = process.argv[2];",
     "const dependencyAncestorCount = Number.parseInt(process.argv[3], 10);",
     `if (!Number.isSafeInteger(dependencyAncestorCount) || dependencyAncestorCount < 1 || dependencyAncestorCount > ${MAX_DEPENDENCY_ANCESTORS}) throw new Error("ACPX provider dependency ancestry is invalid");`,
+    ...(guarded
+      ? [
+          `const guardianFd = ${DEPENDENCY_ANCESTOR_FD_START} + dependencyAncestorCount;`,
+          "const guardianProcessGroupId = Number.parseInt(process.argv[4], 10);",
+          'if (!Number.isSafeInteger(guardianProcessGroupId) || guardianProcessGroupId < 1) throw new Error("ACPX provider guardian identity is invalid");',
+          'const guardian = fs.createReadStream("", { fd: guardianFd, autoClose: false });',
+          "let guardianLost = false;",
+          'const reapOnGuardianLoss = () => { if (guardianLost) return; guardianLost = true; try { process.kill(-guardianProcessGroupId, "SIGKILL"); } catch { process.exit(1); } };',
+          'guardian.once("end", reapOnGuardianLoss);',
+          'guardian.once("error", reapOnGuardianLoss);',
+          "guardian.resume();",
+          "fs.fstatSync(guardianFd + 1);",
+        ]
+      : []),
     "const commandPath = resolve(commandDirectory, commandName);",
-    "process.argv.splice(1, 3, commandPath);",
+    `process.argv.splice(1, ${guarded ? 4 : 3}, commandPath);`,
     `const guardSnapshotModuleLookup = ${guardSnapshotModuleLookup.toString()};`,
     `const directory = process.platform === "linux" ? "/proc/self/fd/${COMMAND_DIRECTORY_FD}" : commandDirectory;`,
     "const directoryUrl = pathToFileURL(`${directory}/`).href;",

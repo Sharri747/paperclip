@@ -854,6 +854,93 @@ describe("ACPX installation integrity", () => {
   );
 
   it.runIf(process.platform !== "win32")(
+    "reaps a fenced provider when its lifetime guardian is SIGKILLed",
+    async () => {
+      const fixture = await persistentInstallationFixture();
+      const ownerScript = join(fixture.root, "guardian-owner.mjs");
+      const pidFile = join(fixture.root, "guardian-provider.pid");
+      const credentialHome = join(fixture.root, "guardian-codex-home");
+      await mkdir(credentialHome, { mode: 0o700 });
+      const moduleUrl = new URL("./installation-integrity.ts", import.meta.url)
+        .href;
+      const credentialModuleUrl = new URL(
+        "./codex-credentials.ts",
+        import.meta.url,
+      ).href;
+      await writeFile(
+        ownerScript,
+        [
+          `const module = await import(${JSON.stringify(moduleUrl)});`,
+          `const credentials = await import(${JSON.stringify(credentialModuleUrl)});`,
+          `const profile = ${JSON.stringify(fixture.profile)};`,
+          `const credential = await credentials.stageManagedCodexCredential({ agentHomeDirectory: ${JSON.stringify(credentialHome)}, environment: { PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: '{"owner":"original"}' } });`,
+          `const paths = new Map(${JSON.stringify([...fixture.paths])});`,
+          "const installation = await module.verifyQualifiedAcpxInstallation(profile, (name) => paths.get(name));",
+          "const lease = await installation.openCommand();",
+          `const provider = lease.spawn([], { env: { ...process.env, PAPERCLIP_PROVIDER_PID_FILE: ${JSON.stringify(pidFile)} } }, { credentialFenceFd: credential.lifetimeFenceFd, activateCredentialFenceOwner: (pid) => credential.activateLifetimeOwner(pid) });`,
+          "await module.awaitVerifiedAcpxProviderOwnership(provider);",
+          'process.send?.({ type: "ready", guardianPid: provider.pid });',
+          "process.stdin.resume();",
+        ].join("\n"),
+      );
+
+      const owner = fork(ownerScript, [], {
+        execArgv: ["--import", "tsx"],
+        stdio: ["pipe", "ignore", "pipe", "ipc"],
+      });
+      let guardianPid = 0;
+      let providerPid = 0;
+      try {
+        const ready = (await childMessage(owner, "ready")) as {
+          guardianPid: number;
+        };
+        guardianPid = ready.guardianPid;
+        providerPid = Number.parseInt(await waitForFile(pidFile), 10);
+        expect(processAlive(providerPid)).toBe(true);
+
+        // Freeze the provider so the guardian and runner can die first. The
+        // provider's inherited fence must still reject a competing owner, and
+        // guardian-pipe EOF must reap it as soon as it can run again.
+        process.kill(providerPid, "SIGSTOP");
+        process.kill(guardianPid, "SIGKILL");
+        owner.kill("SIGKILL");
+        await once(owner, "exit");
+        await expect(
+          stageManagedCodexCredential({
+            agentHomeDirectory: credentialHome,
+            environment: {
+              PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: '{"owner":"contender"}',
+            },
+          }),
+        ).rejects.toThrow("already has an active lease");
+
+        process.kill(providerPid, "SIGCONT");
+        await waitUntil(() => !processAlive(providerPid));
+        const contender = await stageManagedCodexCredential({
+          agentHomeDirectory: credentialHome,
+          environment: {
+            PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: '{"owner":"contender"}',
+          },
+        });
+        await contender.close();
+      } finally {
+        if (owner.exitCode === null && owner.signalCode === null) {
+          owner.kill("SIGKILL");
+          await once(owner, "exit").catch(() => undefined);
+        }
+        if (guardianPid > 0) killGroupBestEffort(guardianPid);
+        if (providerPid > 0 && processAlive(providerPid)) {
+          try {
+            process.kill(providerPid, "SIGKILL");
+          } catch {
+            /* gone */
+          }
+        }
+      }
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
     "dismisses the lifetime sentinel only after normal provider-group cleanup",
     async () => {
       const fixture = await persistentInstallationFixture();
