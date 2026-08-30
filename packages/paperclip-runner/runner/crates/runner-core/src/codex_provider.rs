@@ -156,6 +156,20 @@ impl SettledProviderTurnIds {
     fn contains(&self, provider_turn_id: &str) -> bool {
         self.ids.contains(provider_turn_id)
     }
+
+    fn restore(&mut self, provider_turn_id: String) {
+        // Keep the mutation outside debug_assert!: release builds must retain
+        // the restored identity so the provider cannot reuse it for new work.
+        let inserted = self.insert(provider_turn_id);
+        debug_assert!(
+            inserted,
+            "a fresh provider has capacity for restored completion authority"
+        );
+    }
+
+    fn limit_reached(&self) -> bool {
+        self.ids.len() >= MAX_SETTLED_PROVIDER_TURN_IDS
+    }
 }
 
 enum ProviderRequestError {
@@ -377,11 +391,8 @@ impl CodexProvider {
                 .to_owned(),
         });
         if let Some(authority) = self.completed_turn_authority.as_ref() {
-            debug_assert!(
-                self.settled_provider_turn_ids
-                    .insert(authority.provider_turn_id.clone()),
-                "a fresh provider has capacity for restored completion authority"
-            );
+            self.settled_provider_turn_ids
+                .restore(authority.provider_turn_id.clone());
         }
         // Resuming a completed durable thread and reading its provider state
         // is recovery, not new turn work. Keep the prior terminal authoritative
@@ -402,6 +413,10 @@ impl CodexProvider {
         })
     }
 
+    pub(crate) fn settled_turn_identity_limit_reached(&self) -> bool {
+        self.settled_provider_turn_ids.limit_reached()
+    }
+
     pub fn start_turn(&mut self, message: &str, cwd: &str) -> Result<Value, LocalRunnerError> {
         if self.active_provider_turn_id.is_some() {
             return Err(LocalRunnerError::invalid(
@@ -418,9 +433,9 @@ impl CodexProvider {
                 "Codex turn text is empty or exceeds the 1 MiB limit",
             ));
         }
-        if self.settled_provider_turn_ids.ids.len() >= MAX_SETTLED_PROVIDER_TURN_IDS {
+        if self.settled_provider_turn_ids.limit_reached() {
             return Err(LocalRunnerError::invalid(
-                "Codex settled turn identity limit reached; restart the provider session before accepting more work",
+                "Codex settled turn identity limit reached; start a new durable run before accepting more work",
             ));
         }
         // Attempting replacement work is a post-terminal liveness observation.
@@ -1761,6 +1776,15 @@ mod tests {
 
         assert!(settled.insert("turn-0".to_owned()));
         assert_eq!(settled.ids.len(), MAX_SETTLED_PROVIDER_TURN_IDS);
+    }
+
+    #[test]
+    fn restored_provider_turn_identity_is_retained_in_release_builds() {
+        let mut settled = SettledProviderTurnIds::default();
+
+        settled.restore("turn-restored".to_owned());
+
+        assert!(settled.contains("turn-restored"));
     }
 
     #[test]

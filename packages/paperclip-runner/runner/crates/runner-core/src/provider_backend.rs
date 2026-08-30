@@ -318,6 +318,11 @@ struct CodexProviderState {
     completed_turn_process_generation: Option<u64>,
     #[serde(default)]
     completed_provider_turn_id: Option<String>,
+    // Provider turn identities are scoped to one durable run. Once the live
+    // provider's bounded replay ledger is full, only a new run may reset it;
+    // restarting runnerd must not silently reopen the exhausted identity set.
+    #[serde(default)]
+    provider_turn_identity_limit_reached: bool,
     #[serde(default)]
     receipt_limit_diagnostic_emitted: bool,
     #[serde(default)]
@@ -365,6 +370,7 @@ impl CodexProviderState {
             provider_process_generation: 0,
             completed_turn_process_generation: None,
             completed_provider_turn_id: None,
+            provider_turn_identity_limit_reached: false,
             receipt_limit_diagnostic_emitted: false,
             receipt_limit_interrupt_pending: false,
             receipt_limit_interrupt_accepted: false,
@@ -437,6 +443,7 @@ impl CodexProviderState {
             || (!self.completed_turn_authoritative
                 && (self.completed_turn_process_generation.is_some()
                     || self.completed_provider_turn_id.is_some()))
+            || (self.provider_turn_identity_limit_reached && self.active_provider_turn_id.is_some())
             || self
                 .completed_turn_process_generation
                 .is_some_and(|generation| generation > self.provider_process_generation)
@@ -1088,10 +1095,33 @@ impl CodexCommandExecutor {
         if self
             .state
             .as_ref()
+            .is_some_and(|state| state.provider_turn_identity_limit_reached)
+        {
+            return Err(DurableRunnerError::invalid(
+                "the durable Codex run exhausted its provider-turn identity ledger; start a new run",
+            ));
+        }
+        if self
+            .state
+            .as_ref()
             .is_some_and(|state| state.tool_bridge.durable_run_receipt_limit_reached())
         {
             return Err(DurableRunnerError::invalid(
                 "the durable Codex run exhausted its semantic-tool receipt ledger; start a new run",
+            ));
+        }
+        if self
+            .provider
+            .as_ref()
+            .is_some_and(CodexProvider::settled_turn_identity_limit_reached)
+        {
+            self.state
+                .as_mut()
+                .expect("Codex state remains available at the provider-turn identity limit")
+                .provider_turn_identity_limit_reached = true;
+            self.save_state()?;
+            return Err(DurableRunnerError::invalid(
+                "the durable Codex run exhausted its provider-turn identity ledger; start a new run",
             ));
         }
         if self
@@ -1706,6 +1736,12 @@ impl CodexCommandExecutor {
         // an ambiguous-start failure cannot degrade into an empty successful
         // poll on the same executor.
         self.restore_provider_if_needed()?;
+        // Receipt-limit interruption is autonomous recovery. It must advance
+        // even while older durable events await acknowledgement, otherwise a
+        // slow or disconnected controller can keep an exhausted provider turn
+        // alive forever. Terminal settlement uses the reserved event capacity.
+        self.retry_receipt_limit_interrupt()?;
+        self.settle_receipt_limit_interrupt_if_deadline_elapsed()?;
         if self
             .state
             .as_ref()
@@ -1713,9 +1749,8 @@ impl CodexCommandExecutor {
         {
             return Ok(());
         }
-        self.retry_receipt_limit_interrupt()?;
         if self.provider.is_none() {
-            return self.settle_receipt_limit_interrupt_if_deadline_elapsed();
+            return Ok(());
         }
         for _ in 0..MAX_EVENTS_PER_POLL {
             let event = self
@@ -1769,6 +1804,11 @@ impl CodexCommandExecutor {
                                     | "turn.interrupted"
                             )
                         });
+                    let provider_turn_identity_limit_reached = terminal_event_type.is_some()
+                        && self
+                            .provider
+                            .as_ref()
+                            .is_some_and(CodexProvider::settled_turn_identity_limit_reached);
                     let identity = self.event_identity.clone();
                     let state = self
                         .state
@@ -1793,6 +1833,8 @@ impl CodexCommandExecutor {
                         state.reconcile_active_provider_turn(Some(provider_turn_id));
                     }
                     if terminal_event_type.is_some() {
+                        state.provider_turn_identity_limit_reached |=
+                            provider_turn_identity_limit_reached;
                         let settled = state
                             .tool_bridge
                             .settle_turn("provider_turn_terminated")
@@ -2051,6 +2093,7 @@ mod tests {
             provider_process_generation: 0,
             completed_turn_process_generation: None,
             completed_provider_turn_id: None,
+            provider_turn_identity_limit_reached: false,
             receipt_limit_diagnostic_emitted: false,
             receipt_limit_interrupt_pending: false,
             receipt_limit_interrupt_accepted: false,
@@ -2593,5 +2636,102 @@ mod tests {
             .expect_err("an exhausted receipt ledger must reject later turns");
         assert!(error.to_string().contains("start a new run"));
         assert!(executor.provider.is_none());
+    }
+
+    #[test]
+    fn exhausted_provider_turn_identities_require_a_new_durable_run() {
+        let mut state = CodexProviderState::new(
+            CodexProviderConfig {
+                provider: "codex".to_owned(),
+                driver: "codex_app_server".to_owned(),
+                provider_version: "test".to_owned(),
+                command: PathBuf::from("codex"),
+                args: vec!["app-server".to_owned()],
+                cwd: std::env::current_dir()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                model: None,
+                provider_session_id: None,
+                instructions: String::new(),
+                approval_policy: "never".to_owned(),
+            },
+            None,
+            ProviderToolBridge::default(),
+        );
+        state.provider_turn_identity_limit_reached = true;
+        let mut executor = CodexCommandExecutor::new(PathBuf::from("unused-test-state"));
+        executor.state = Some(state);
+        executor.restore_checked = true;
+
+        let error = executor
+            .start_turn(&json!({"text": "must not reach the provider"}))
+            .expect_err("an exhausted provider-turn ledger must reject later turns");
+        assert!(error.to_string().contains("start a new run"));
+        assert!(executor.provider.is_none());
+    }
+
+    #[test]
+    fn receipt_limit_deadline_progresses_with_unacknowledged_events() {
+        let directory = std::env::temp_dir().join(format!(
+            "paperclip-provider-receipt-deadline-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let mut state = CodexProviderState::new(
+            CodexProviderConfig {
+                provider: "codex".to_owned(),
+                driver: "codex_app_server".to_owned(),
+                provider_version: "test".to_owned(),
+                command: PathBuf::from("codex"),
+                args: vec!["app-server".to_owned()],
+                cwd: std::env::current_dir()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                model: None,
+                provider_session_id: None,
+                instructions: String::new(),
+                approval_policy: "never".to_owned(),
+            },
+            None,
+            ProviderToolBridge::default(),
+        );
+        state.thread_id = Some("thread-1".to_owned());
+        state.active_provider_turn_id = Some("turn-1".to_owned());
+        state.lifecycle = "turn_active".to_owned();
+        state.receipt_limit_diagnostic_emitted = true;
+        state.receipt_limit_interrupt_pending = true;
+        state.receipt_limit_interrupt_attempts = MAX_RECEIPT_LIMIT_INTERRUPT_ATTEMPTS;
+        state.receipt_limit_interrupt_deadline_unix_ms = Some(1);
+        state
+            .push_event(NormalizedProviderEvent {
+                event_type: "provider.notice.recorded".to_owned(),
+                priority: EventPriority::P1,
+                payload: json!({"message": "awaiting acknowledgement"}),
+            })
+            .unwrap();
+        let mut executor = CodexCommandExecutor::new(&directory);
+        executor.state = Some(state);
+        executor.event_identity = Some(ProviderEventIdentity {
+            run_id: "run-1".to_owned(),
+            normalized_session_id: "session-1".to_owned(),
+            turn_id: "turn-1".to_owned(),
+            item_id: "item-1".to_owned(),
+        });
+        executor.restore_checked = true;
+
+        executor.poll_provider().unwrap();
+
+        let state = executor.state.as_ref().unwrap();
+        assert_eq!(state.lifecycle, "provider_exited");
+        assert!(state.active_provider_turn_id.is_none());
+        assert!(!state.receipt_limit_interrupt_pending);
+        assert!(state
+            .pending_events
+            .iter()
+            .any(|event| event.event_type == "turn.failed"));
+        fs::remove_dir_all(directory).unwrap();
     }
 }
