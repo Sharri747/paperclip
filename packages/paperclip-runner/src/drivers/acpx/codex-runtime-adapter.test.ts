@@ -430,6 +430,68 @@ describe("Codex ACPX runtime adapter", () => {
     }
   });
 
+  it("shares one reconciliation budget across sequential late failures", async () => {
+    vi.useFakeTimers();
+    try {
+      const runtime = fakeRuntime();
+      const releasedAttempts = Array.from({ length: 4 }, () => {
+        let reject!: (error: unknown) => void;
+        const promise = new Promise<void>((_resolve, rejectPromise) => {
+          reject = rejectPromise;
+        });
+        return { promise, reject };
+      });
+      vi.mocked(runtime.close)
+        .mockReturnValueOnce(releasedAttempts[0]!.promise)
+        .mockReturnValueOnce(releasedAttempts[1]!.promise)
+        .mockReturnValueOnce(releasedAttempts[2]!.promise)
+        .mockReturnValueOnce(releasedAttempts[3]!.promise)
+        .mockResolvedValue(undefined);
+      const port = await openCodexAcpxRuntime(openOptions(fakeCommand()), {
+        createRegistry: () => registry(),
+        createStore: () => store(),
+        createRuntime: () => runtime,
+        runtimeCloseTimeoutMs: 1,
+      });
+
+      for (const reason of [
+        "first released close",
+        "second released close",
+        "third released close",
+        "fourth released close",
+      ]) {
+        const close = expect(port.close({ reason })).rejects.toThrow(
+          "ACPX runtime and provider cleanup failed",
+        );
+        await Promise.resolve();
+        await vi.advanceTimersByTimeAsync(1);
+        await close;
+      }
+      await expect(port.close({ reason: "newer close succeeds" }))
+        .resolves.toBeUndefined();
+      expect(runtime.close).toHaveBeenCalledTimes(5);
+
+      for (let index = 0; index < 3; index += 1) {
+        releasedAttempts[index]!.reject(
+          new Error(`released close ${index + 1} failed late`),
+        );
+        await vi.advanceTimersByTimeAsync(0);
+        expect(runtime.close).toHaveBeenCalledTimes(6 + index);
+      }
+
+      // Three automatic attempts exhaust the one port-lifetime budget. The
+      // fourth watched attempt cannot replenish it merely by failing after
+      // the preceding reconciliation closes succeeded.
+      releasedAttempts[3]!.reject(
+        new Error("released close 4 failed after the global budget"),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      expect(runtime.close).toHaveBeenCalledTimes(8);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("rechecks late failures when a reconciliation owner finalizes", async () => {
     vi.useFakeTimers();
     let releaseOwnerFinalizer: (() => void) | undefined;
@@ -504,7 +566,7 @@ describe("Codex ACPX runtime adapter", () => {
       expect(runtime.close).toHaveBeenCalledTimes(4);
       expect(runtime.close).toHaveBeenLastCalledWith({
         handle: HANDLE,
-        reason: "ACPX late protocol cleanup reconciliation 1",
+        reason: "ACPX late protocol cleanup reconciliation 2",
         discardPersistentState: false,
       });
       await vi.advanceTimersByTimeAsync(0);

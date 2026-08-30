@@ -374,6 +374,10 @@ function runtimePort(
   let runtimeCloseAttempt: Promise<unknown | null> | undefined;
   let runtimeCloseAttemptReconciliationGeneration = 0;
   let lateReconciliationOwner: Promise<void> | undefined;
+  // This is a lifetime budget for the port, not a per-failure-generation
+  // budget. A released attempt may settle after a newer close succeeds, so
+  // replenishing the counter on success would let each older attempt create a
+  // fresh fully budgeted reconciliation loop.
   let lateReconciliationAttempts = 0;
   let lateFailureGeneration = 0;
   let reconciledLateFailureGeneration = 0;
@@ -402,8 +406,6 @@ function runtimePort(
         if (hasUnreconciledLateFailure()) {
           retry =
             attemptNumber < MAX_LATE_RUNTIME_CLEANUP_RECONCILIATION_ATTEMPTS;
-        } else {
-          lateReconciliationAttempts = 0;
         }
       },
       () => {
@@ -473,7 +475,6 @@ function runtimePort(
         observedReconciliationGeneration,
       );
       runtimeClosed = !hasUnreconciledLateFailure();
-      if (runtimeClosed) lateReconciliationAttempts = 0;
     } else {
       runtimeClosed = false;
     }
