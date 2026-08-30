@@ -419,6 +419,11 @@ impl ProviderToolBridge {
         self.durable_run_receipt_limit_reached
     }
 
+    #[cfg(test)]
+    pub(crate) fn retained_result_bytes_for_test(&self) -> usize {
+        self.retained_result_bytes
+    }
+
     pub fn replay_result(
         &self,
         call_id: &str,

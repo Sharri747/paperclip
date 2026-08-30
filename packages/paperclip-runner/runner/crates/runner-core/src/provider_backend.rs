@@ -11,7 +11,9 @@ use std::os::unix::fs::PermissionsExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::codex_provider::{CodexProvider, CodexProviderConfig, CodexProviderEvent};
+use crate::codex_provider::{
+    CodexProvider, CodexProviderConfig, CodexProviderEvent, MAX_SETTLED_PROVIDER_TURN_IDS,
+};
 use crate::durable::{
     create_private_temporary_file, current_unix_ms, open_private_regular_file, sanitize_value,
     verify_private_directory, Command, CommandExecution, CommandExecutor, DurableRunnerConfig,
@@ -34,7 +36,12 @@ const MAX_EVENTS_PER_POLL: usize = 128;
 // receipt-limit stop, settle every retained call, and record the provider plus
 // run terminal events.
 const MAX_REGULAR_QUEUED_PROVIDER_EVENTS: usize = 2 * MAX_PENDING_CALLS + 3;
-const MAX_TERMINAL_SETTLEMENT_EVENTS: usize = MAX_PENDING_CALLS + 4;
+const MAX_RECEIPT_LIMIT_TERMINAL_RESERVE: usize = MAX_PENDING_CALLS + 4;
+// During a receipt-limit stop, provider polling continues even when older
+// events remain unacknowledged so an already-buffered authoritative terminal
+// wins over the deadline fallback. Reserve one complete poll of cleanup events
+// in addition to the semantic-result and terminal envelopes.
+const MAX_TERMINAL_SETTLEMENT_EVENTS: usize = MAX_PENDING_CALLS + MAX_EVENTS_PER_POLL + 4;
 const MAX_QUEUED_PROVIDER_EVENTS: usize =
     MAX_REGULAR_QUEUED_PROVIDER_EVENTS + MAX_TERMINAL_SETTLEMENT_EVENTS;
 const MAX_RECEIPT_LIMIT_INTERRUPT_ATTEMPTS: u8 = 3;
@@ -318,6 +325,11 @@ struct CodexProviderState {
     completed_turn_process_generation: Option<u64>,
     #[serde(default)]
     completed_provider_turn_id: Option<String>,
+    // Unlike the live provider process, the durable run survives restarts.
+    // Retain every bounded terminal turn identity so a resumed provider cannot
+    // reuse an older identity or reopen the per-run exhaustion boundary.
+    #[serde(default)]
+    settled_provider_turn_ids: std::collections::BTreeSet<String>,
     // Provider turn identities are scoped to one durable run. Once the live
     // provider's bounded replay ledger is full, only a new run may reset it;
     // restarting runnerd must not silently reopen the exhausted identity set.
@@ -370,6 +382,7 @@ impl CodexProviderState {
             provider_process_generation: 0,
             completed_turn_process_generation: None,
             completed_provider_turn_id: None,
+            settled_provider_turn_ids: std::collections::BTreeSet::new(),
             provider_turn_identity_limit_reached: false,
             receipt_limit_diagnostic_emitted: false,
             receipt_limit_interrupt_pending: false,
@@ -443,6 +456,17 @@ impl CodexProviderState {
             || (!self.completed_turn_authoritative
                 && (self.completed_turn_process_generation.is_some()
                     || self.completed_provider_turn_id.is_some()))
+            || self.settled_provider_turn_ids.len() > MAX_SETTLED_PROVIDER_TURN_IDS
+            || self
+                .settled_provider_turn_ids
+                .iter()
+                .any(|provider_turn_id| {
+                    provider_turn_id.is_empty()
+                        || provider_turn_id.len() > 240
+                        || provider_turn_id.chars().any(char::is_control)
+                })
+            || (self.settled_provider_turn_ids.len() >= MAX_SETTLED_PROVIDER_TURN_IDS
+                && !self.provider_turn_identity_limit_reached)
             || (self.provider_turn_identity_limit_reached && self.active_provider_turn_id.is_some())
             || self
                 .completed_turn_process_generation
@@ -575,6 +599,24 @@ impl CodexProviderState {
         self.push_event_with_limit(event, MAX_QUEUED_PROVIDER_EVENTS)
     }
 
+    fn push_receipt_limit_cleanup_event(
+        &mut self,
+        event: NormalizedProviderEvent,
+    ) -> Result<(), DurableRunnerError> {
+        let queue_event =
+            !self.queued_events.is_empty() || self.pending_events.len() >= MAX_EVENTS_PER_POLL;
+        if queue_event
+            && self.queued_events.len()
+                >= MAX_QUEUED_PROVIDER_EVENTS - MAX_RECEIPT_LIMIT_TERMINAL_RESERVE
+        {
+            // Continue draining the provider so an authoritative terminal can
+            // still be observed, but never let cleanup chatter consume the
+            // semantic-result and terminal-event reserve.
+            return Ok(());
+        }
+        self.push_terminal_event(event)
+    }
+
     fn refill_pending_events(&mut self) {
         while self.pending_events.len() < MAX_EVENTS_PER_POLL {
             let Some(event) = self.queued_events.pop_front() else {
@@ -650,6 +692,44 @@ impl CodexProviderState {
         };
     }
 
+    fn settle_active_provider_turn_identity(&mut self) -> Result<(), DurableRunnerError> {
+        let provider_turn_id = self.active_provider_turn_id.clone().ok_or_else(|| {
+            DurableRunnerError::invalid("Codex terminal omitted its active provider turn identity")
+        })?;
+        if !self.settled_provider_turn_ids.contains(&provider_turn_id)
+            && self.settled_provider_turn_ids.len() >= MAX_SETTLED_PROVIDER_TURN_IDS
+        {
+            return Err(DurableRunnerError::invalid(
+                "Codex settled turn identity limit reached",
+            ));
+        }
+        self.settled_provider_turn_ids.insert(provider_turn_id);
+        if self.settled_provider_turn_ids.len() >= MAX_SETTLED_PROVIDER_TURN_IDS {
+            self.provider_turn_identity_limit_reached = true;
+        }
+        Ok(())
+    }
+
+    fn recovered_settled_provider_turn_ids(
+        &self,
+    ) -> Result<std::collections::BTreeSet<String>, DurableRunnerError> {
+        let mut settled_provider_turn_ids = self.settled_provider_turn_ids.clone();
+        // State written before the durable set was introduced retained only
+        // the latest completed identity. Fold that legacy authority into the
+        // new ledger before the provider is allowed to accept replacement work.
+        if let Some(provider_turn_id) = self.completed_provider_turn_id.clone() {
+            if !settled_provider_turn_ids.contains(&provider_turn_id)
+                && settled_provider_turn_ids.len() >= MAX_SETTLED_PROVIDER_TURN_IDS
+            {
+                return Err(DurableRunnerError::invalid(
+                    "Codex settled turn identity limit reached during recovery",
+                ));
+            }
+            settled_provider_turn_ids.insert(provider_turn_id);
+        }
+        Ok(settled_provider_turn_ids)
+    }
+
     fn extend_terminal_events(
         &mut self,
         events: impl IntoIterator<Item = NormalizedProviderEvent>,
@@ -717,8 +797,13 @@ impl CodexCommandExecutor {
         file.read_to_end(&mut input).map_err(|error| {
             DurableRunnerError::invalid(format!("failed to read Codex provider state: {error}"))
         })?;
-        let state: CodexProviderState = serde_json::from_slice(&input).map_err(|error| {
+        let mut state: CodexProviderState = serde_json::from_slice(&input).map_err(|error| {
             DurableRunnerError::invalid(format!("Codex provider state is malformed: {error}"))
+        })?;
+        state.tool_bridge.attach_existing_run().map_err(|error| {
+            DurableRunnerError::invalid(format!(
+                "Codex semantic tool state could not be reattached: {error}"
+            ))
         })?;
         state.validate()?;
         self.state = Some(state);
@@ -750,6 +835,7 @@ impl CodexCommandExecutor {
         let completed_turn_process_generation = state.completed_turn_process_generation;
         let completed_provider_turn_id = state.completed_provider_turn_id.clone();
         let ambiguous_turn_start_pending = state.ambiguous_turn_start_pending;
+        let settled_provider_turn_ids = state.recovered_settled_provider_turn_ids()?;
         let mut provider = CodexProvider::start_with_tools_for_generation(
             &state.config,
             state.tool_bridge.authorized_tools().cloned(),
@@ -759,6 +845,13 @@ impl CodexCommandExecutor {
         .map_err(|error| {
             DurableRunnerError::invalid(format!("failed to resume Codex provider: {error}"))
         })?;
+        provider
+            .restore_settled_turn_identities(settled_provider_turn_ids.iter().cloned())
+            .map_err(|error| {
+                DurableRunnerError::invalid(format!(
+                    "failed to restore Codex provider turn identities: {error}"
+                ))
+            })?;
         let recovered_active_turn_id = provider.active_provider_turn_id().map(str::to_owned);
         if ambiguous_turn_start_pending {
             let recovered_turn_id = recovered_active_turn_id.as_deref().ok_or_else(|| {
@@ -780,10 +873,17 @@ impl CodexCommandExecutor {
             completed_provider_turn_id.as_deref(),
         );
         self.provider = Some(provider);
-        self.state
-            .as_mut()
-            .expect("Codex state remains available during recovery")
-            .provider_process_generation = process_generation;
+        {
+            let state = self
+                .state
+                .as_mut()
+                .expect("Codex state remains available during recovery");
+            state.provider_process_generation = process_generation;
+            state.settled_provider_turn_ids = settled_provider_turn_ids;
+            if state.settled_provider_turn_ids.len() >= MAX_SETTLED_PROVIDER_TURN_IDS {
+                state.provider_turn_identity_limit_reached = true;
+            }
+        }
         if provider_had_exited
             || ambiguous_turn_start_pending
             || recovered_active_turn_id != previous_active_turn_id
@@ -796,6 +896,7 @@ impl CodexCommandExecutor {
                 .as_mut()
                 .expect("Codex state remains available during recovery");
             if recovered_turn_ended {
+                state.settle_active_provider_turn_identity()?;
                 let settled = state
                     .tool_bridge
                     .settle_turn("provider_turn_terminated")
@@ -981,6 +1082,7 @@ impl CodexCommandExecutor {
                 .provider_process_generation
                 .checked_add(1)
                 .ok_or_else(|| DurableRunnerError::invalid("Codex process generation exhausted"))?;
+            let settled_provider_turn_ids = state.recovered_settled_provider_turn_ids()?;
             let mut provider = CodexProvider::start_with_tools_for_generation(
                 &state.config,
                 state.tool_bridge.authorized_tools().cloned(),
@@ -990,16 +1092,30 @@ impl CodexCommandExecutor {
             .map_err(|error| {
                 DurableRunnerError::invalid(format!("failed to start Codex provider: {error}"))
             })?;
+            provider
+                .restore_settled_turn_identities(settled_provider_turn_ids.iter().cloned())
+                .map_err(|error| {
+                    DurableRunnerError::invalid(format!(
+                        "failed to restore Codex provider turn identities: {error}"
+                    ))
+                })?;
             provider.restore_completed_turn_authority(
                 state.completed_turn_authoritative && provider.active_provider_turn_id().is_none(),
                 state.completed_turn_process_generation,
                 state.completed_provider_turn_id.as_deref(),
             );
             self.provider = Some(provider);
-            self.state
-                .as_mut()
-                .expect("Codex state remains available after provider start")
-                .provider_process_generation = process_generation;
+            {
+                let state = self
+                    .state
+                    .as_mut()
+                    .expect("Codex state remains available after provider start");
+                state.provider_process_generation = process_generation;
+                state.settled_provider_turn_ids = settled_provider_turn_ids;
+                if state.settled_provider_turn_ids.len() >= MAX_SETTLED_PROVIDER_TURN_IDS {
+                    state.provider_turn_identity_limit_reached = true;
+                }
+            }
             self.save_state()?;
         }
         self.provider
@@ -1333,21 +1449,27 @@ impl CodexCommandExecutor {
         operation_id: String,
         reason: String,
     ) -> Result<(), DurableRunnerError> {
-        self.state
+        let state = self
+            .state
             .as_mut()
-            .expect("Codex state remains available for a rejected tool call")
-            .push_event(NormalizedProviderEvent {
-                event_type: "harness.diagnostic".to_owned(),
-                priority: EventPriority::P0,
-                payload: json!({
-                    "provider": "codex",
-                    "code": "semantic_tool_denied",
-                    "operationId": operation_id,
-                    "callId": call_id,
-                    "message": reason,
-                    "paperclipExecuted": false,
-                }),
-            })?;
+            .expect("Codex state remains available for a rejected tool call");
+        let event = NormalizedProviderEvent {
+            event_type: "harness.diagnostic".to_owned(),
+            priority: EventPriority::P0,
+            payload: json!({
+                "provider": "codex",
+                "code": "semantic_tool_denied",
+                "operationId": operation_id,
+                "callId": call_id,
+                "message": reason,
+                "paperclipExecuted": false,
+            }),
+        };
+        if state.receipt_limit_interrupt_pending {
+            state.push_receipt_limit_cleanup_event(event)?;
+        } else {
+            state.push_event(event)?;
+        }
         self.save_state()?;
         let rejection = ToolResult {
             call_id,
@@ -1459,6 +1581,7 @@ impl CodexCommandExecutor {
             .state
             .as_mut()
             .expect("Codex state remains available at its receipt-limit retry bound");
+        state.settle_active_provider_turn_identity()?;
         let settled = state
             .tool_bridge
             .settle_turn("semantic_tool_turn_receipt_limit")
@@ -1741,16 +1864,19 @@ impl CodexCommandExecutor {
         // slow or disconnected controller can keep an exhausted provider turn
         // alive forever. Terminal settlement uses the reserved event capacity.
         self.retry_receipt_limit_interrupt()?;
-        self.settle_receipt_limit_interrupt_if_deadline_elapsed()?;
-        if self
-            .state
-            .as_ref()
-            .is_some_and(|state| !state.pending_events.is_empty())
+        let receipt_limit_terminal_poll = self.state.as_ref().is_some_and(|state| {
+            state.receipt_limit_interrupt_pending && state.active_provider_turn_id.is_some()
+        });
+        if !receipt_limit_terminal_poll
+            && self
+                .state
+                .as_ref()
+                .is_some_and(|state| !state.pending_events.is_empty())
         {
             return Ok(());
         }
         if self.provider.is_none() {
-            return Ok(());
+            return self.settle_receipt_limit_interrupt_if_deadline_elapsed();
         }
         for _ in 0..MAX_EVENTS_PER_POLL {
             let event = self
@@ -1833,6 +1959,7 @@ impl CodexCommandExecutor {
                         state.reconcile_active_provider_turn(Some(provider_turn_id));
                     }
                     if terminal_event_type.is_some() {
+                        state.settle_active_provider_turn_identity()?;
                         state.provider_turn_identity_limit_reached |=
                             provider_turn_identity_limit_reached;
                         let settled = state
@@ -1881,6 +2008,10 @@ impl CodexCommandExecutor {
                     }
                     if terminal_event_type.is_some() {
                         state.extend_terminal_events(normalized)?;
+                    } else if receipt_limit_terminal_poll {
+                        for event in normalized {
+                            state.push_receipt_limit_cleanup_event(event)?;
+                        }
                     } else {
                         state.extend_events(normalized)?;
                     }
@@ -1898,29 +2029,35 @@ impl CodexCommandExecutor {
                         .or_else(|| question_set.pointer("/questions/0/prompt"))
                         .and_then(Value::as_str)
                         .unwrap_or("Codex needs your input");
-                    self.state
+                    let state = self
+                        .state
                         .as_mut()
-                        .expect("Codex state remains available while polling")
-                        .push_event(NormalizedProviderEvent {
-                            event_type: "runtime_request.created".to_owned(),
-                            priority: EventPriority::P0,
-                            payload: json!({
-                                "request": {
-                                    "schema": "paperclip.runtime_request.v2",
-                                    "requestKind": "runtime",
-                                    "requestId": request_id,
-                                    "type": "input",
-                                    "status": "pending",
-                                    "prompt": prompt,
-                                    "input": question_set,
-                                    "origin": {
-                                        "adapter": "codex-app-server",
-                                        "provider": "codex",
-                                        "method": "item/tool/requestUserInput",
-                                    },
+                        .expect("Codex state remains available while polling");
+                    let event = NormalizedProviderEvent {
+                        event_type: "runtime_request.created".to_owned(),
+                        priority: EventPriority::P0,
+                        payload: json!({
+                            "request": {
+                                "schema": "paperclip.runtime_request.v2",
+                                "requestKind": "runtime",
+                                "requestId": request_id,
+                                "type": "input",
+                                "status": "pending",
+                                "prompt": prompt,
+                                "input": question_set,
+                                "origin": {
+                                    "adapter": "codex-app-server",
+                                    "provider": "codex",
+                                    "method": "item/tool/requestUserInput",
                                 },
-                            }),
-                        })?;
+                            },
+                        }),
+                    };
+                    if receipt_limit_terminal_poll {
+                        state.push_receipt_limit_cleanup_event(event)?;
+                    } else {
+                        state.push_event(event)?;
+                    }
                     self.save_state()?;
                 }
                 CodexProviderEvent::Exited {
@@ -2093,6 +2230,7 @@ mod tests {
             provider_process_generation: 0,
             completed_turn_process_generation: None,
             completed_provider_turn_id: None,
+            settled_provider_turn_ids: std::collections::BTreeSet::new(),
             provider_turn_identity_limit_reached: false,
             receipt_limit_diagnostic_emitted: false,
             receipt_limit_interrupt_pending: false,
@@ -2306,6 +2444,17 @@ mod tests {
             MAX_REGULAR_QUEUED_PROVIDER_EVENTS
         );
         assert!(state.push_event(ordinary_event()).is_err());
+
+        for _ in 0..MAX_EVENTS_PER_POLL {
+            state
+                .push_receipt_limit_cleanup_event(ordinary_event())
+                .unwrap();
+        }
+        let cleanup_boundary = state.queued_events.len();
+        state
+            .push_receipt_limit_cleanup_event(ordinary_event())
+            .expect("cleanup overflow is dropped while preserving terminal capacity");
+        assert_eq!(state.queued_events.len(), cleanup_boundary);
 
         for index in 0..MAX_PENDING_CALLS {
             state
@@ -2669,6 +2818,165 @@ mod tests {
             .expect_err("an exhausted provider-turn ledger must reject later turns");
         assert!(error.to_string().contains("start a new run"));
         assert!(executor.provider.is_none());
+    }
+
+    #[test]
+    fn restore_reattaches_the_durable_tool_result_byte_counter() {
+        let directory = std::env::temp_dir().join(format!(
+            "paperclip-provider-tool-byte-restore-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let operation = crate::provider_bridge::AuthorizedTool {
+            operation_id: "get_task_context".to_owned(),
+            version: 1,
+            description: "Read the active task context.".to_owned(),
+            input_schema: json!({"type": "object"}),
+            response_schema: json!({"type": "object"}),
+        };
+        let mut bridge = ProviderToolBridge::default();
+        bridge
+            .prepare(AuthorizedToolSet {
+                schema: TOOL_SET_SCHEMA.to_owned(),
+                schema_version: 1,
+                catalog_digest: authorized_tool_catalog_digest(std::slice::from_ref(&operation))
+                    .unwrap(),
+                operations: vec![operation],
+            })
+            .unwrap();
+        bridge
+            .begin_call(
+                "call-1".to_owned(),
+                "get_task_context".to_owned(),
+                json!({}),
+            )
+            .unwrap();
+        bridge
+            .apply_result(ToolResult {
+                call_id: "call-1".to_owned(),
+                operation_id: "get_task_context".to_owned(),
+                result: json!({"ok": true}),
+                is_error: false,
+            })
+            .unwrap();
+        bridge.settle_turn("provider_turn_terminated").unwrap();
+        assert!(bridge.retained_result_bytes_for_test() > 0);
+
+        let state = CodexProviderState::new(
+            CodexProviderConfig {
+                provider: "codex".to_owned(),
+                driver: "codex_app_server".to_owned(),
+                provider_version: "test".to_owned(),
+                command: PathBuf::from("codex"),
+                args: vec!["app-server".to_owned()],
+                cwd: std::env::current_dir()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                model: None,
+                provider_session_id: None,
+                instructions: String::new(),
+                approval_policy: "never".to_owned(),
+            },
+            None,
+            bridge,
+        );
+        let writer = CodexCommandExecutor::new(&directory);
+        writer.persist_state(&state).unwrap();
+
+        let mut recovered = CodexCommandExecutor::new(&directory);
+        recovered.restore().unwrap();
+        assert!(
+            recovered
+                .state
+                .as_ref()
+                .unwrap()
+                .tool_bridge
+                .retained_result_bytes_for_test()
+                > 0
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn durable_provider_turn_ledger_backfills_legacy_completion_authority() {
+        let mut state = CodexProviderState::new(
+            CodexProviderConfig {
+                provider: "codex".to_owned(),
+                driver: "codex_app_server".to_owned(),
+                provider_version: "test".to_owned(),
+                command: PathBuf::from("codex"),
+                args: vec!["app-server".to_owned()],
+                cwd: std::env::current_dir()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                model: None,
+                provider_session_id: None,
+                instructions: String::new(),
+                approval_policy: "never".to_owned(),
+            },
+            None,
+            ProviderToolBridge::default(),
+        );
+        state.completed_turn_authoritative = true;
+        state.completed_turn_process_generation = Some(1);
+        state.completed_provider_turn_id = Some("provider-turn-legacy".to_owned());
+        state.provider_process_generation = 1;
+
+        let recovered = state.recovered_settled_provider_turn_ids().unwrap();
+
+        assert!(recovered.contains("provider-turn-legacy"));
+    }
+
+    #[test]
+    fn durable_provider_turn_ledger_closes_at_the_exact_run_boundary() {
+        let mut state = CodexProviderState::new(
+            CodexProviderConfig {
+                provider: "codex".to_owned(),
+                driver: "codex_app_server".to_owned(),
+                provider_version: "test".to_owned(),
+                command: PathBuf::from("codex"),
+                args: vec!["app-server".to_owned()],
+                cwd: std::env::current_dir()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                model: None,
+                provider_session_id: None,
+                instructions: String::new(),
+                approval_policy: "never".to_owned(),
+            },
+            None,
+            ProviderToolBridge::default(),
+        );
+        state.thread_id = Some("thread-1".to_owned());
+        state.lifecycle = "turn_active".to_owned();
+        for index in 0..(MAX_SETTLED_PROVIDER_TURN_IDS - 1) {
+            state
+                .settled_provider_turn_ids
+                .insert(format!("provider-turn-{index}"));
+        }
+        state.active_provider_turn_id = Some("provider-turn-final".to_owned());
+
+        state.settle_active_provider_turn_identity().unwrap();
+        state.active_provider_turn_id = None;
+        state.lifecycle = "session_open".to_owned();
+
+        assert_eq!(
+            state.settled_provider_turn_ids.len(),
+            MAX_SETTLED_PROVIDER_TURN_IDS
+        );
+        assert!(state.provider_turn_identity_limit_reached);
+        state.validate().unwrap();
+        let recovered: CodexProviderState =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert_eq!(
+            recovered.settled_provider_turn_ids,
+            state.settled_provider_turn_ids
+        );
+        recovered.validate().unwrap();
     }
 
     #[test]

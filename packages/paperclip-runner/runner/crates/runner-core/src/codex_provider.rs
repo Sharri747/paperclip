@@ -17,7 +17,7 @@ const MAX_BUFFERED_MESSAGES: usize = 1_024;
 const MAX_INSTRUCTIONS_BYTES: usize = 1024 * 1024;
 const MAX_PENDING_TOOL_REQUESTS: usize = 4_096;
 const MAX_PENDING_TOOL_REQUEST_BYTES: usize = 16 * 1024 * 1024;
-const MAX_SETTLED_PROVIDER_TURN_IDS: usize = 4_096;
+pub(crate) const MAX_SETTLED_PROVIDER_TURN_IDS: usize = 4_096;
 type QuestionOptionLabels = BTreeMap<String, BTreeMap<String, String>>;
 type QuestionSetMapping = (String, Value, QuestionOptionLabels);
 
@@ -165,6 +165,20 @@ impl SettledProviderTurnIds {
             inserted,
             "a fresh provider has capacity for restored completion authority"
         );
+    }
+
+    fn restore_all(
+        &mut self,
+        provider_turn_ids: impl IntoIterator<Item = String>,
+    ) -> Result<(), LocalRunnerError> {
+        for provider_turn_id in provider_turn_ids {
+            if !self.insert(provider_turn_id) {
+                return Err(LocalRunnerError::invalid(
+                    "Codex settled turn identity limit reached during recovery",
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn limit_reached(&self) -> bool {
@@ -402,6 +416,14 @@ impl CodexProvider {
         // It remains authoritative as a result, but cannot reconcile a crash
         // from this newly supervised provider process.
         self.completion_reconciliation_pending = false;
+    }
+
+    pub(crate) fn restore_settled_turn_identities(
+        &mut self,
+        provider_turn_ids: impl IntoIterator<Item = String>,
+    ) -> Result<(), LocalRunnerError> {
+        self.settled_provider_turn_ids
+            .restore_all(provider_turn_ids)
     }
 
     pub(crate) fn completed_turn_authority(&self) -> Option<(u64, &str)> {
@@ -1785,6 +1807,18 @@ mod tests {
         settled.restore("turn-restored".to_owned());
 
         assert!(settled.contains("turn-restored"));
+    }
+
+    #[test]
+    fn restores_the_complete_durable_provider_turn_ledger() {
+        let mut settled = SettledProviderTurnIds::default();
+
+        settled
+            .restore_all(["turn-older".to_owned(), "turn-latest".to_owned()])
+            .unwrap();
+
+        assert!(settled.contains("turn-older"));
+        assert!(settled.contains("turn-latest"));
     }
 
     #[test]

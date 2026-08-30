@@ -992,7 +992,7 @@ fn full_identity_ledger_rejects_new_calls_without_pruning_history() {
     let error = recovered
         .begin_call("current-call".into(), "get_task_context".into(), json!({}))
         .expect_err("the full durable identity ledger must reject new work");
-    assert!(error.to_string().contains("identity limit"));
+    assert!(error.is_active_turn_receipt_limit());
 
     let settled = recovered
         .settle_turn("provider_turn_terminated")

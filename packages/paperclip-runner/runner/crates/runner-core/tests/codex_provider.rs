@@ -1619,6 +1619,66 @@ fn codex_fails_closed_when_a_provider_reuses_an_older_settled_turn_id() {
 }
 
 #[test]
+fn durable_backend_rejects_an_older_provider_turn_id_after_restart() {
+    let directory = temporary_directory("durable-older-reused-turn-after-restart");
+    let config = provider_config(&directory, &[]);
+    let runner_config = durable_config(&directory);
+    let mut first = CodexCommandExecutor::with_runner_config(&directory, &runner_config);
+    first
+        .execute(&command(
+            "prepare",
+            1,
+            "run.prepare",
+            json!({"provider": config}),
+        ))
+        .expect("prepare Codex provider");
+    first
+        .execute(&command("open", 2, "session.open", json!({})))
+        .expect("open Codex session");
+
+    for (sequence, message) in [(3, "Complete turn one."), (4, "Complete turn two.")] {
+        first
+            .execute(&command(
+                &format!("turn-{sequence}"),
+                sequence,
+                "turn.start",
+                json!({"text": message}),
+            ))
+            .expect("start completed provider turn");
+        let mut completed = false;
+        for _ in 0..32 {
+            completed |= poll_and_ack(&mut first)
+                .expect("poll completed provider turn")
+                .iter()
+                .any(|event| event.event_type == "turn.completed");
+            if completed {
+                break;
+            }
+        }
+        assert!(completed);
+    }
+    first.shutdown().expect("stop first provider process");
+    drop(first);
+
+    // The fake provider's process-local counter restarts at provider-turn-1.
+    // Durable state must still remember that older identity, not only the most
+    // recent provider-turn-2 completion authority.
+    let mut recovered = CodexCommandExecutor::with_runner_config(&directory, &runner_config);
+    let error = recovered
+        .execute(&command(
+            "turn-reused",
+            5,
+            "turn.start",
+            json!({"text": "Do not accept an older provider turn identity."}),
+        ))
+        .expect_err("reject a provider turn identity retained before restart");
+    assert!(error.to_string().contains("reused a settled"));
+
+    recovered.shutdown().expect("stop recovered provider");
+    fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
+}
+
+#[test]
 fn codex_rejects_a_two_turn_old_call_while_idle() {
     let directory = temporary_directory("delayed-tool-after-second-turn-completion");
     let config = provider_config(&directory, &["--delayed-tool-after-second-turn-completion"]);
@@ -2687,6 +2747,75 @@ fn receipt_limit_accepts_a_terminal_after_the_initial_interrupt_deadline() {
         }),
         "fast provider polls must not replace a delayed terminal with fallback failure"
     );
+
+    recovered.shutdown().expect("stop recovered provider");
+    fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
+}
+
+#[test]
+fn receipt_limit_polls_an_authoritative_terminal_with_unacknowledged_events() {
+    let directory = temporary_directory("receipt-limit-terminal-with-unacked-events");
+    let config = provider_config(
+        &directory,
+        &[
+            "--require-dynamic-tool",
+            "--hold-turn",
+            "--emit-tool-call-on-resume",
+            "--accept-interrupt-without-terminal-once",
+        ],
+    );
+    let runner_config = durable_config(&directory);
+    let mut first = CodexCommandExecutor::with_runner_config(&directory, &runner_config);
+    first
+        .execute(&command(
+            "prepare",
+            1,
+            "run.prepare",
+            json!({
+                "provider": config,
+                "authorizedTools": task_context_tool_set(),
+            }),
+        ))
+        .expect("prepare Codex provider");
+    first
+        .execute(&command("open", 2, "session.open", json!({})))
+        .expect("open Codex session");
+    first
+        .execute(&command(
+            "turn",
+            3,
+            "turn.start",
+            json!({"text": "Retain the receipt-limit diagnostic until terminal polling."}),
+        ))
+        .expect("start held provider turn");
+    drop(first);
+    saturate_provider_tool_receipts(&directory);
+
+    let mut recovered = CodexCommandExecutor::with_runner_config(&directory, &runner_config);
+    let pending = recovered
+        .poll_events()
+        .expect("begin the durable receipt-limit stop");
+    assert!(pending.iter().any(|event| {
+        event.event_type == "harness.diagnostic"
+            && event.payload["code"] == "semantic_tool_turn_receipt_limit"
+    }));
+    assert!(!pending
+        .iter()
+        .any(|event| event.event_type == "turn.interrupted"));
+
+    let terminal = recovered
+        .poll_events()
+        .expect("poll the provider terminal before old events are acknowledged");
+    assert!(terminal.iter().any(|event| {
+        event.event_type == "turn.interrupted" && event.payload.get("code").is_none()
+    }));
+    assert!(!terminal.iter().any(|event| {
+        event.event_type == "turn.interrupted"
+            && event.payload["code"] == "semantic_tool_turn_receipt_limit_interrupt_deadline"
+    }));
+    recovered
+        .acknowledge_events(terminal.len())
+        .expect("acknowledge the diagnostic and authoritative terminal together");
 
     recovered.shutdown().expect("stop recovered provider");
     fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
