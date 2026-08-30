@@ -1,3 +1,4 @@
+use num_bigint::BigUint;
 use paperclip_runner_core::question_response::validate_question_response;
 use serde_json::{json, Value};
 
@@ -87,7 +88,7 @@ fn rounds_large_prefixed_integers_like_javascript_number() {
 }
 
 #[test]
-fn accepts_radix_integers_in_javascripts_upper_finite_interval() {
+fn matches_javascript_radix_overflow_midpoint() {
     let mut unbounded_set = question_set();
     let validation = unbounded_set["questions"][3]["textValidation"]
         .as_object_mut()
@@ -95,13 +96,32 @@ fn accepts_radix_integers_in_javascripts_upper_finite_interval() {
     validation.remove("minimum");
     validation.remove("maximum");
 
-    let mut response = valid_response();
-    response["answers"]["count"] = json!({"text":format!("0x{}", "f".repeat(256))});
-    validate_question_response(&unbounded_set, &response)
-        .expect("the largest radix integer below 2^1024 rounds to Number.MAX_VALUE");
+    let overflow = BigUint::from(1_u8) << 1024_usize;
+    // Number.MAX_VALUE is 2^1024 - 2^971. The midpoint to the
+    // non-representable 2^1024 sentinel is 2^1024 - 2^970. At the midpoint,
+    // nearest-ties-to-even selects the sentinel, which JavaScript exposes as
+    // Infinity; the immediately preceding integer still rounds to MAX_VALUE.
+    let infinite_midpoint = &overflow - (BigUint::from(1_u8) << 970_usize);
+    let largest_finite = &infinite_midpoint - BigUint::from(1_u8);
+    let below_overflow_but_infinite = &overflow - BigUint::from(1_u8);
 
-    response["answers"]["count"] = json!({"text":format!("0x1{}", "0".repeat(256))});
-    assert!(validate_question_response(&unbounded_set, &response).is_err());
+    for (prefix, radix) in [("0x", 16), ("0o", 8), ("0b", 2)] {
+        let mut response = valid_response();
+        response["answers"]["count"] =
+            json!({"text":format!("{prefix}{}", largest_finite.to_str_radix(radix))});
+        validate_question_response(&unbounded_set, &response).unwrap_or_else(|error| {
+            panic!("the largest finite-rounding base-{radix} integer was rejected: {error}")
+        });
+
+        for value in [&infinite_midpoint, &below_overflow_but_infinite, &overflow] {
+            response["answers"]["count"] =
+                json!({"text":format!("{prefix}{}", value.to_str_radix(radix))});
+            assert!(
+                validate_question_response(&unbounded_set, &response).is_err(),
+                "base-{radix} value that rounds to Infinity was accepted"
+            );
+        }
+    }
 }
 
 #[test]
