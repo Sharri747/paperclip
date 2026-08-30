@@ -734,6 +734,63 @@ describe("managed Codex credentials", () => {
   );
 
   it.runIf(process.platform !== "win32")(
+    "bounds a directory close that never settles after a durable fsync",
+    async () => {
+      const fixture = await credentialFixture();
+      const actualFs = await vi.importActual<typeof import("node:fs/promises")>(
+        "node:fs/promises",
+      );
+      let directoryCloseAttempts = 0;
+      let observeFirstClose!: () => void;
+      let observeLeaseClose!: () => void;
+      const firstClose = new Promise<void>((resolveClose) => {
+        observeFirstClose = resolveClose;
+      });
+      const leaseClose = new Promise<void>((resolveClose) => {
+        observeLeaseClose = resolveClose;
+      });
+      vi.doMock("node:fs/promises", () => ({
+        ...actualFs,
+        open: async (
+          path: Parameters<typeof open>[0],
+          flags: Parameters<typeof open>[1],
+          mode?: Parameters<typeof open>[2],
+        ): Promise<FileHandle> => {
+          if (String(path) === fixture.home) {
+            return {
+              close: async (): Promise<void> => {
+                directoryCloseAttempts += 1;
+                if (directoryCloseAttempts === 1) observeFirstClose();
+                if (directoryCloseAttempts === 3) observeLeaseClose();
+                return await new Promise<void>(() => undefined);
+              },
+              sync: async (): Promise<void> => undefined,
+            } as FileHandle;
+          }
+          return await actualFs.open(path, flags, mode);
+        },
+      }));
+      vi.resetModules();
+      const freshCredentials = await import("./codex-credentials.js");
+      vi.useFakeTimers();
+
+      const staging = freshCredentials.stageManagedCodexCredential({
+        agentHomeDirectory: fixture.home,
+        environment: { OPENAI_API_KEY: "launch-only-key" },
+      });
+      await firstClose;
+      await vi.advanceTimersByTimeAsync(20_000);
+      const lease = await staging;
+
+      const closing = lease.close();
+      await leaseClose;
+      await vi.advanceTimersByTimeAsync(20_000);
+      await closing;
+      expect(directoryCloseAttempts).toBe(4);
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
     "keeps intent-publication failure before credential mutation and scrubs without process memory",
     async () => {
       const fixture = await credentialFixture();

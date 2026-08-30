@@ -1083,13 +1083,19 @@ async function syncDirectory(directory: string): Promise<void> {
       // handle after our retry budget has advanced, close it without keeping
       // credential admission or cleanup pending.
       void openAttempt
-        .then((lateHandle) => lateHandle.close())
+        .then((lateHandle) => closeDirectoryHandle(lateHandle, directory))
         .catch(() => undefined);
     }
     throw error;
   }
 
-  const syncAttempt = handle.sync();
+  let syncAttempt: Promise<void>;
+  try {
+    syncAttempt = handle.sync();
+  } catch (error) {
+    await closeDirectoryHandle(handle, directory);
+    throw error;
+  }
   let syncTimedOut = false;
   try {
     await waitForDirectorySyncOperation(syncAttempt, "fsync", directory);
@@ -1099,17 +1105,39 @@ async function syncDirectory(directory: string): Promise<void> {
       // FileHandle.close() waits for outstanding operations. Detach cleanup
       // from a timed-out fsync so the durable retry loop remains bounded.
       void syncAttempt
-        .finally(() => handle.close())
+        .finally(() => closeDirectoryHandle(handle, directory))
         .catch(() => undefined);
     }
     throw error;
   } finally {
-    if (!syncTimedOut) await handle.close();
+    // A completed fsync is the durability boundary. Close is resource cleanup:
+    // bound and detach it rather than turning durable state into a failure or
+    // masking the original fsync error.
+    if (!syncTimedOut) await closeDirectoryHandle(handle, directory);
+  }
+}
+
+async function closeDirectoryHandle(
+  handle: FileHandle,
+  directory: string,
+): Promise<void> {
+  try {
+    const closeAttempt = handle.close();
+    try {
+      await waitForDirectorySyncOperation(closeAttempt, "close", directory);
+    } catch {
+      // close(2) cannot be cancelled. Keep observing a late rejection without
+      // holding credential admission, cleanup, or the process open.
+      void closeAttempt.catch(() => undefined);
+    }
+  } catch {
+    // Closing cannot invalidate an fsync that already completed, and callers
+    // with a failed fsync must retain that original durability error.
   }
 }
 
 class DirectorySyncOperationTimeoutError extends Error {
-  constructor(operation: "open" | "fsync", directory: string) {
+  constructor(operation: "open" | "fsync" | "close", directory: string) {
     super(
       `Managed Codex credential directory ${operation} timed out after ${DIRECTORY_SYNC_OPERATION_TIMEOUT_MS}ms for ${directory}`,
     );
@@ -1119,7 +1147,7 @@ class DirectorySyncOperationTimeoutError extends Error {
 
 async function waitForDirectorySyncOperation<T>(
   operationAttempt: Promise<T>,
-  operation: "open" | "fsync",
+  operation: "open" | "fsync" | "close",
   directory: string,
 ): Promise<T> {
   let timeout: NodeJS.Timeout | undefined;
