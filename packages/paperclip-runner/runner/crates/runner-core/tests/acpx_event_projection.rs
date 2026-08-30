@@ -232,7 +232,7 @@ fn rejects_invalid_durable_projection_identity() {
 }
 
 #[test]
-fn runtime_request_projection_respects_its_narrow_identity_schema() {
+fn runtime_request_projection_preserves_durable_identity_boundaries() {
     let canonical_request_schema: Value = serde_json::from_str(include_str!(
         "../../../../protocol/schemas/request.schema.json"
     ))
@@ -254,27 +254,26 @@ fn runtime_request_projection_respects_its_narrow_identity_schema() {
     let valid = project_acpx_state_event(&context(), &request_event).unwrap();
     assert!(request_validator.is_valid(&valid[0].payload["request"]));
 
-    for (label, field) in [("turn", "turnId"), ("item", "itemId")] {
-        let mut oversized_context = context();
-        let oversized = "x".repeat(161);
-        if label == "turn" {
-            oversized_context.turn_id = oversized.clone();
-        } else {
-            oversized_context.item_id = oversized.clone();
-        }
-        let error = project_acpx_state_event(&oversized_context, &request_event)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains(&format!("runtime request {label} identity")));
-
-        let mut invalid_request = valid[0].payload["request"].clone();
-        invalid_request[field] = Value::String(oversized);
-        assert!(!request_validator.is_valid(&invalid_request));
-    }
-
     let mut durable_context = context();
     durable_context.turn_id = "t".repeat(240);
     durable_context.item_id = "i".repeat(240);
+    let durable_request = project_acpx_state_event(&durable_context, &request_event).unwrap();
+    assert_eq!(
+        durable_request[0].payload["request"]["turnId"],
+        durable_context.turn_id
+    );
+    assert_eq!(
+        durable_request[0].payload["request"]["itemId"],
+        durable_context.item_id
+    );
+    assert!(request_validator.is_valid(&durable_request[0].payload["request"]));
+
+    for field in ["turnId", "itemId"] {
+        let mut invalid_request = valid[0].payload["request"].clone();
+        invalid_request[field] = Value::String("x".repeat(241));
+        assert!(!request_validator.is_valid(&invalid_request));
+    }
+
     let diagnostic = AcpxProviderStateEvent::Diagnostic {
         code: "notice".to_owned(),
         message: "message".to_owned(),

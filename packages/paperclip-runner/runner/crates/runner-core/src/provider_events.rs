@@ -53,9 +53,9 @@ impl AcpxEventProjectionContext {
         for (value, label, max_chars) in [
             (&self.run_id, "run", 160),
             (&self.normalized_session_id, "normalized session", 160),
-            // Semantic-tool correlation accepts the durable 240-character
-            // identity contract. Narrower payloads validate explicitly at
-            // their projection boundary below.
+            // Turn and item correlation use the durable 240-character
+            // identity contract shared by PRP events, runtime requests, and
+            // semantic-tool receipts.
             (&self.turn_id, "turn", 240),
             (&self.item_id, "item", 240),
         ] {
@@ -153,11 +153,6 @@ pub fn project_acpx_state_event(
             origin,
         } => {
             validate_projection_identity(request_id, "request", 160)?;
-            // paperclip.runtime_request.v2 is intentionally narrower than
-            // semantic correlation: never emit a request that its canonical
-            // schema rejects, even when the durable context itself is valid.
-            validate_projection_identity(&context.turn_id, "runtime request turn", 160)?;
-            validate_projection_identity(&context.item_id, "runtime request item", 160)?;
             let prompt = question_set
                 .get("title")
                 .or_else(|| question_set.pointer("/questions/0/prompt"))
