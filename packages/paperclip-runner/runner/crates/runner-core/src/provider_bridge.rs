@@ -166,6 +166,11 @@ pub struct ProviderToolBridge {
     retained_result_bytes: usize,
     #[serde(default)]
     settled_call_ids: SettledCallIds,
+    // Once the run-wide identity ledger is full, the active turn must stop
+    // before older replay identities can be released. Persist this transition
+    // so recovery cannot leave semantic tools disabled forever.
+    #[serde(default, skip_serializing_if = "is_false")]
+    settled_history_reset_pending: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -193,6 +198,10 @@ impl Display for ProviderBridgeError {
 
 impl Error for ProviderBridgeError {}
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 impl ProviderToolBridge {
     pub fn prepare(&mut self, tool_set: AuthorizedToolSet) -> Result<(), ProviderBridgeError> {
         self.prepare_internal(tool_set, false)
@@ -209,6 +218,7 @@ impl ProviderToolBridge {
         self.settled_results.clear();
         self.retained_result_bytes = 0;
         self.settled_call_ids.clear();
+        self.settled_history_reset_pending = false;
         Ok(())
     }
 
@@ -265,6 +275,7 @@ impl ProviderToolBridge {
                 && self.completed.is_empty()
                 && self.settled_results.is_empty()
                 && self.settled_call_ids.is_empty()
+                && !self.settled_history_reset_pending
             {
                 Ok(())
             } else {
@@ -306,6 +317,18 @@ impl ProviderToolBridge {
         {
             return Err(ProviderBridgeError::invalid(
                 "recovered provider tool bridge exceeds its durable call identity limit",
+            ));
+        }
+        if self.settled_history_reset_pending
+            && self
+                .settled_call_ids
+                .len()
+                .saturating_add(self.pending.len())
+                .saturating_add(self.completed.len())
+                < MAX_SETTLED_CALL_IDS
+        {
+            return Err(ProviderBridgeError::invalid(
+                "recovered provider tool bridge has an invalid settled history reset",
             ));
         }
         for call_id in self.settled_call_ids.iter() {
@@ -500,9 +523,8 @@ impl ProviderToolBridge {
             .saturating_add(self.completed.len())
             >= MAX_SETTLED_CALL_IDS
         {
-            return Err(ProviderBridgeError::invalid(
-                "durable provider tool call identity limit reached",
-            ));
+            self.settled_history_reset_pending = true;
+            return Err(ProviderBridgeError::active_turn_receipt_limit());
         }
         let result_reserve = self
             .pending
@@ -648,13 +670,24 @@ impl ProviderToolBridge {
                 },
             );
         }
-        let next_retained_bytes =
-            retained_result_bytes(self.settled_results.iter().chain(settled_entries.iter()))?;
+        let next_retained_bytes = if self.settled_history_reset_pending {
+            retained_result_bytes(settled_entries.iter())?
+        } else {
+            retained_result_bytes(self.settled_results.iter().chain(settled_entries.iter()))?
+        };
         ensure_settled_result_capacity(next_retained_bytes, std::iter::empty())?;
 
         // Identity and byte capacity were reserved at admission. After the
         // preflight above, moving exact receipts cannot fail or strand a
         // terminal provider turn.
+        if self.settled_history_reset_pending {
+            // The controlled turn stop is the epoch boundary: calls from the
+            // stopped turn remain exact below, while older identities can no
+            // longer be replayed by that terminated provider turn.
+            self.settled_call_ids.clear();
+            self.settled_results.clear();
+            self.settled_history_reset_pending = false;
+        }
         self.settled_call_ids
             .extend_recent(settled_entries.keys().cloned(), MAX_SETTLED_CALL_IDS);
         self.pending.clear();

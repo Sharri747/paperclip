@@ -751,10 +751,21 @@ fn reserves_identity_capacity_before_accepting_a_call() {
         .unwrap();
     bridge.settle_turn("provider_turn_terminated").unwrap();
 
-    assert!(bridge
+    let error = bridge
         .begin_call("overflow".into(), "get_task_context".into(), json!({}))
-        .is_err());
-    assert!(bridge.settle_turn("provider_turn_terminated").is_ok());
+        .expect_err("identity exhaustion must stop the active turn");
+    assert!(error.is_active_turn_receipt_limit());
+
+    let encoded = serde_json::to_string(&bridge).unwrap();
+    let mut recovered: ProviderToolBridge = serde_json::from_str(&encoded).unwrap();
+    recovered.attach_existing_run().unwrap();
+    recovered
+        .settle_turn("provider_turn_terminated")
+        .expect("the controlled turn stop releases the prior identity epoch");
+    assert!(!recovered.has_completed_call("settled-0"));
+    recovered
+        .begin_call("overflow".into(), "get_task_context".into(), json!({}))
+        .expect("a later turn can use semantic tools after the controlled stop");
 }
 
 #[test]
