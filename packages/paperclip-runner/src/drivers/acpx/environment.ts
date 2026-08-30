@@ -32,7 +32,6 @@ export function createSanitizedAcpxSpawnInput(
         : [
             "OPENAI_API_KEY",
             "CODEX_API_KEY",
-            "PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET",
           ];
   const allowed = new Set([
     "PATH",
