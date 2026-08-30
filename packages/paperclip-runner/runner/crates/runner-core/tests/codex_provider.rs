@@ -590,11 +590,20 @@ fn rejected_replacement_turn_start_preserves_prior_completion_authority() {
     provider
         .start_turn("Reject replacement work.", &config.cwd)
         .expect_err("the replacement turn/start returns a definite rejection");
+    let mut buffered_notification_seen = false;
     let rejected_start_exit = (0..64).find_map(|_| {
         match provider
             .poll()
             .expect("poll exit after rejected replacement start")
         {
+            Some(CodexProviderEvent::Notification { method, params })
+                if method == "warning"
+                    && params.get("message").and_then(Value::as_str)
+                        == Some("buffered before replacement rejection") =>
+            {
+                buffered_notification_seen = true;
+                None
+            }
             Some(CodexProviderEvent::Exited {
                 success,
                 completed_turn_authoritative,
@@ -608,6 +617,7 @@ fn rejected_replacement_turn_start_preserves_prior_completion_authority() {
             _ => None,
         }
     });
+    assert!(buffered_notification_seen);
     assert_eq!(rejected_start_exit, Some((false, true, true)));
 
     fs::remove_dir_all(directory).expect("remove Codex integration-test directory");

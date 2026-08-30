@@ -164,13 +164,18 @@ struct PendingRuntimeRequest {
     option_labels: QuestionOptionLabels,
 }
 
+struct BufferedProviderMessage {
+    value: Value,
+    revokes_completion_reconciliation: bool,
+}
+
 pub struct CodexProvider {
     process: SupervisedProcess,
     next_request_id: u64,
     thread_id: String,
     provider_session_id: Option<String>,
     active_provider_turn_id: Option<String>,
-    pending_messages: VecDeque<Value>,
+    pending_messages: VecDeque<BufferedProviderMessage>,
     authorized_tool_ids: BTreeSet<String>,
     pending_tool_requests: BTreeMap<String, PendingToolRequest>,
     pending_tool_request_bytes: usize,
@@ -370,6 +375,7 @@ impl CodexProvider {
         // Preserve the prior durable result until a replacement turn identity
         // is accepted, but do not let it hide a crash during this request.
         let prior_reconciliation_pending = self.completion_reconciliation_pending;
+        let prior_buffered_message_count = self.pending_messages.len();
         self.completion_reconciliation_pending = false;
         let result = match self.request_classified(
             "turn/start",
@@ -384,6 +390,13 @@ impl CodexProvider {
             Ok(result) => result,
             Err(ProviderRequestError::Rejected(error)) => {
                 // A definite rejection proves no replacement work began.
+                for buffered in self
+                    .pending_messages
+                    .iter_mut()
+                    .skip(prior_buffered_message_count)
+                {
+                    buffered.revokes_completion_reconciliation = false;
+                }
                 self.completion_reconciliation_pending = prior_reconciliation_pending;
                 return Err(error);
             }
@@ -467,8 +480,12 @@ impl CodexProvider {
     }
 
     pub fn poll(&mut self) -> Result<Option<CodexProviderEvent>, LocalRunnerError> {
-        let message = if let Some(message) = self.pending_messages.pop_front() {
-            message
+        let buffered = self.pending_messages.pop_front();
+        let revokes_completion_reconciliation = buffered
+            .as_ref()
+            .map_or(true, |message| message.revokes_completion_reconciliation);
+        let message = if let Some(buffered) = buffered {
+            buffered.value
         } else {
             let Some(line) = self.process.receive_stdout_line(Duration::from_millis(1))? else {
                 let exit = self.process.try_wait()?;
@@ -512,7 +529,8 @@ impl CodexProvider {
             parse_provider_message(&line)?
         };
 
-        if self.completed_turn_authority.is_some()
+        if revokes_completion_reconciliation
+            && self.completed_turn_authority.is_some()
             && self.active_provider_turn_id.is_none()
             && message.get("method").and_then(Value::as_str) != Some("turn/completed")
         {
@@ -827,7 +845,10 @@ impl CodexProvider {
                     "Codex emitted too many messages before a request response",
                 )));
             }
-            self.pending_messages.push_back(message);
+            self.pending_messages.push_back(BufferedProviderMessage {
+                value: message,
+                revokes_completion_reconciliation: true,
+            });
         }
     }
 }

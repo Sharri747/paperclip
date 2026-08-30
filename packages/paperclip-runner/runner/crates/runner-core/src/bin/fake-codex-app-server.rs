@@ -233,6 +233,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 turn_start_count += 1;
                 if reject_second_turn_start && turn_start_count == 2 {
                     send(json!({
+                        "method": "warning",
+                        "params": {"message": "buffered before replacement rejection"}
+                    }))?;
+                    send(json!({
                         "id": id,
                         "error": {"code": -32000, "message": "replacement turn rejected"}
                     }))?;
