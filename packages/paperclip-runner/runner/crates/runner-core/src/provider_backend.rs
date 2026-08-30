@@ -466,6 +466,12 @@ impl CodexProviderState {
                         || provider_turn_id.len() > 240
                         || provider_turn_id.chars().any(char::is_control)
                 })
+            || self
+                .active_provider_turn_id
+                .as_ref()
+                .is_some_and(|provider_turn_id| {
+                    self.settled_provider_turn_ids.contains(provider_turn_id)
+                })
             || (self.settled_provider_turn_ids.len() >= MAX_SETTLED_PROVIDER_TURN_IDS
                 && !self.provider_turn_identity_limit_reached)
             || (self.provider_turn_identity_limit_reached && self.active_provider_turn_id.is_some())
@@ -852,8 +858,56 @@ impl CodexCommandExecutor {
                 DurableRunnerError::invalid(format!(
                     "failed to restore Codex provider turn identities: {error}"
                 ))
-            })?;
+        })?;
         let recovered_active_turn_id = provider.active_provider_turn_id().map(str::to_owned);
+        if let Some(reused_provider_turn_id) = recovered_active_turn_id
+            .as_ref()
+            .filter(|provider_turn_id| settled_provider_turn_ids.contains(*provider_turn_id))
+            .cloned()
+        {
+            // The durable terminal ledger is authoritative. A resumed provider
+            // that reports one of those identities as active is contradictory
+            // and may still be mutating the workspace. Terminate that process
+            // generation and persist the run closed before exposing recovery
+            // to the controller; otherwise this path would reopen settled work.
+            let provider_shutdown_failed = provider.shutdown().is_err();
+            let state = self
+                .state
+                .as_mut()
+                .expect("Codex state remains available during recovery");
+            state.provider_process_generation = process_generation;
+            state.settled_provider_turn_ids = settled_provider_turn_ids;
+            state.active_provider_turn_id = None;
+            state.ambiguous_turn_start_pending = false;
+            state.completed_turn_authoritative = false;
+            state.completed_turn_process_generation = None;
+            state.completed_provider_turn_id = None;
+            state.receipt_limit_diagnostic_emitted = false;
+            state.receipt_limit_interrupt_pending = false;
+            state.receipt_limit_interrupt_accepted = false;
+            state.receipt_limit_interrupt_attempts = 0;
+            state.receipt_limit_interrupt_deadline_unix_ms = None;
+            state.last_agent_message = None;
+            state.lifecycle = "closed".to_owned();
+            // Closing the provider is the safety boundary. Preserve that
+            // durable transition even when an already-full event backlog has
+            // no room for an additional diagnostic.
+            let _ = state.push_terminal_event(NormalizedProviderEvent {
+                event_type: "harness.diagnostic".to_owned(),
+                priority: EventPriority::P0,
+                payload: json!({
+                    "provider": "codex",
+                    "code": "provider_turn_identity_reused",
+                    "providerTurnId": reused_provider_turn_id,
+                    "message": "Codex recovery reported a previously settled turn identity as active; Paperclip terminated the provider and closed the durable run",
+                    "paperclipAccepted": false,
+                    "providerReportedActive": true,
+                    "providerShutdownFailed": provider_shutdown_failed,
+                }),
+            });
+            self.save_state()?;
+            return Ok(());
+        }
         if ambiguous_turn_start_pending {
             let recovered_turn_id = recovered_active_turn_id.as_deref().ok_or_else(|| {
                 DurableRunnerError::invalid(

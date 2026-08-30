@@ -1773,6 +1773,96 @@ fn durable_backend_rejects_an_older_provider_turn_id_after_restart() {
 }
 
 #[test]
+fn durable_recovery_closes_a_provider_that_reopens_a_settled_turn() {
+    let directory = temporary_directory("durable-settled-turn-active-on-recovery");
+    let config = provider_config(&directory, &[]);
+    let runner_config = durable_config(&directory);
+    let mut first = CodexCommandExecutor::with_runner_config(&directory, &runner_config);
+    first
+        .execute(&command(
+            "prepare",
+            1,
+            "run.prepare",
+            json!({"provider": config}),
+        ))
+        .expect("prepare Codex provider");
+    first
+        .execute(&command("open", 2, "session.open", json!({})))
+        .expect("open Codex session");
+    first
+        .execute(&command(
+            "turn",
+            3,
+            "turn.start",
+            json!({"text": "Complete the durable turn."}),
+        ))
+        .expect("start provider turn");
+    let mut completed = false;
+    for _ in 0..32 {
+        completed |= poll_and_ack(&mut first)
+            .expect("poll completed provider turn")
+            .iter()
+            .any(|event| event.event_type == "turn.completed");
+        if completed {
+            break;
+        }
+    }
+    assert!(completed);
+    first.shutdown().expect("stop first provider process");
+    drop(first);
+
+    // Contradict the durable terminal ledger with a resumed provider snapshot
+    // that reports the exact settled identity as active again.
+    fs::write(
+        directory.join("fake-state.json"),
+        serde_json::to_vec_pretty(&json!({
+            "threadId": "codex-thread-1",
+            "activeTurnId": "provider-turn-1",
+        }))
+        .unwrap(),
+    )
+    .expect("write contradictory fake provider state");
+
+    let resumes_before_recovery = call_count(&directory, "thread/resume");
+    let mut recovered = CodexCommandExecutor::with_runner_config(&directory, &runner_config);
+    let events = recovered
+        .poll_events()
+        .expect("fail-closed recovery remains observable");
+    assert!(events.iter().any(|event| {
+        event.event_type == "harness.diagnostic"
+            && event.payload["code"] == "provider_turn_identity_reused"
+            && event.payload["providerTurnId"] == "provider-turn-1"
+    }));
+    assert_eq!(
+        call_count(&directory, "thread/resume"),
+        resumes_before_recovery + 1,
+    );
+    let persisted: Value = serde_json::from_slice(
+        &fs::read(directory.join("codex-provider-state.json"))
+            .expect("read fail-closed provider state"),
+    )
+    .expect("parse fail-closed provider state");
+    assert_eq!(persisted["lifecycle"], "closed");
+    assert!(persisted["activeProviderTurnId"].is_null());
+    assert_eq!(persisted["completedTurnAuthoritative"], false);
+
+    drop(recovered);
+    let resumes_before_closed_restore = call_count(&directory, "thread/resume");
+    let mut closed = CodexCommandExecutor::with_runner_config(&directory, &runner_config);
+    closed
+        .poll_events()
+        .expect("closed recovery state remains readable");
+    assert_eq!(
+        call_count(&directory, "thread/resume"),
+        resumes_before_closed_restore,
+        "closed recovery must not resume the contradictory provider turn again",
+    );
+
+    closed.shutdown().expect("close fail-closed executor");
+    fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
+}
+
+#[test]
 fn codex_rejects_a_two_turn_old_call_while_idle() {
     let directory = temporary_directory("delayed-tool-after-second-turn-completion");
     let config = provider_config(&directory, &["--delayed-tool-after-second-turn-completion"]);
@@ -2533,6 +2623,28 @@ fn durable_backend_resumes_the_active_thread_without_restarting_the_turn() {
     recovered
         .shutdown()
         .expect("stop recovered provider process");
+    fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
+}
+
+#[test]
+fn codex_resume_rejects_an_oversized_active_turn_identity() {
+    let directory = temporary_directory("resume-oversized-active-turn-id");
+    let config = provider_config(&directory, &[]);
+    fs::write(
+        directory.join("fake-state.json"),
+        serde_json::to_vec_pretty(&json!({
+            "threadId": "codex-thread-1",
+            "activeTurnId": "x".repeat(241),
+        }))
+        .unwrap(),
+    )
+    .expect("write fake provider state with an oversized active identity");
+
+    let error = CodexProvider::start(&config, Some("codex-thread-1"))
+        .err()
+        .expect("reject an oversized recovered provider turn identity");
+    assert!(error.to_string().contains("invalid turn.id"));
+
     fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
 }
 

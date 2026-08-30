@@ -380,7 +380,7 @@ impl CodexProvider {
         if resume_thread_id.is_some() {
             let snapshot = provider.read_thread()?;
             provider.active_provider_turn_id = latest_active_turn_id(&snapshot)
-                .map(|turn_id| bounded_identifier(Some(&turn_id), "Codex turn id"))
+                .map(|provider_turn_id| bounded_provider_turn_id(Some(&provider_turn_id)))
                 .transpose()?;
         }
         Ok(provider)
