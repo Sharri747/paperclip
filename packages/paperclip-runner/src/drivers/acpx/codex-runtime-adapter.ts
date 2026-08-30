@@ -18,7 +18,10 @@ import type {
   AcpxRuntimePortIdentity,
   AcpxRuntimePortOpenOptions,
 } from "./runtime-host.js";
-import { awaitVerifiedAcpxProviderOwnership } from "./installation-integrity.js";
+import {
+  assertVerifiedAcpxProviderPlatform,
+  awaitVerifiedAcpxProviderOwnership,
+} from "./installation-integrity.js";
 import { decideAcpxPermission } from "./permission-policy.js";
 
 const VERIFIED_COMMAND_SENTINEL = "paperclip-verified-acpx-command";
@@ -90,11 +93,9 @@ export async function openCodexAcpxRuntime(
   // start a provider would create a cleanup state that cannot guarantee both a
   // bounded sidecar exit and retained ownership of an unresponsive process
   // tree when Node cannot safely signal a verified provider process group.
-  if ((dependencies.platform ?? process.platform) === "win32") {
-    throw new Error(
-      "The production ACPX runtime is unavailable on Windows because verified provider launch requires atomic no-follow file opening",
-    );
-  }
+  assertVerifiedAcpxProviderPlatform(
+    dependencies.platform ?? process.platform,
+  );
   if (options.profile.agent !== "codex") {
     throw new Error(
       "The production ACPX runtime currently supports Codex only",

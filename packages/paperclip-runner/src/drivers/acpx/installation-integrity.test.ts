@@ -905,6 +905,8 @@ describe("ACPX installation integrity", () => {
         process.kill(guardianPid, "SIGKILL");
         owner.kill("SIGKILL");
         await once(owner, "exit");
+        // The provider's inherited listener remains authoritative whether the
+        // dead guardian is still observable as a zombie or has been reaped.
         await expect(
           stageManagedCodexCredential({
             agentHomeDirectory: credentialHome,
@@ -912,7 +914,9 @@ describe("ACPX installation integrity", () => {
               PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: '{"owner":"contender"}',
             },
           }),
-        ).rejects.toThrow("already has an active lease");
+        ).rejects.toThrow(
+          /already has an active lease|could not safely bypass an unresponsive lease endpoint/,
+        );
 
         process.kill(providerPid, "SIGCONT");
         await waitUntil(() => !processAlive(providerPid));

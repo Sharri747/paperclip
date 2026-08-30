@@ -131,6 +131,17 @@ export interface VerifiedAcpxProviderLifetime {
   activateCredentialFenceOwner(pid: number): Promise<void>;
 }
 
+/** Fail closed where verified provider-group ownership cannot be guaranteed. */
+export function assertVerifiedAcpxProviderPlatform(
+  platform: NodeJS.Platform,
+): void {
+  if (platform === "win32") {
+    throw new Error(
+      "The production ACPX runtime is unavailable on Windows because verified provider launch requires atomic no-follow file opening",
+    );
+  }
+}
+
 /** Wait until the verified wrapper has armed owner-death and credential fencing. */
 export async function awaitVerifiedAcpxProviderOwnership(
   child: ChildProcess,
@@ -603,6 +614,7 @@ function commandLease(
       let child: ChildProcess;
       try {
         const guarded = lifetime !== undefined;
+        if (guarded) assertVerifiedAcpxProviderPlatform(process.platform);
         const providerBootstrap = guarded
           ? format === "module"
             ? GUARDED_MODULE_SNAPSHOT_BOOTSTRAP
