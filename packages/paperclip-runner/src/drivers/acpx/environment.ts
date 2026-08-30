@@ -1,14 +1,27 @@
 import type { QualifiedAcpxAgent } from "./qualified-profiles.js";
 
+declare const sanitizedAcpxSpawnInputBrand: unique symbol;
+
 /**
- * Build the complete environment visible to the ACPX sidecar. Agent-specific
- * homes and bridge secrets are injected just in time by AcpxRuntimeHost and
- * never inherited from the Paperclip server process.
+ * Opaque child-process input produced only after the host environment crosses
+ * the ACPX credential allowlist. Future ACPX launchers accept this boundary
+ * object rather than an arbitrary `process.env`-shaped value.
  */
-export function createSanitizedAcpxEnvironment(
+export interface SanitizedAcpxSpawnInput {
+  readonly env: Readonly<NodeJS.ProcessEnv>;
+  readonly [sanitizedAcpxSpawnInputBrand]: true;
+}
+
+/**
+ * Build the only host-environment input that may cross an ACPX child-process
+ * launch boundary. Agent-specific homes are added by the later runtime sandbox;
+ * Paperclip transport and native MCP credentials are never inherited from the
+ * host process.
+ */
+export function createSanitizedAcpxSpawnInput(
   environment: NodeJS.ProcessEnv | undefined,
   agent: QualifiedAcpxAgent,
-): NodeJS.ProcessEnv {
+): SanitizedAcpxSpawnInput {
   const source = environment ?? process.env;
   const result: NodeJS.ProcessEnv = {};
   const credentialNames =
@@ -59,5 +72,7 @@ export function createSanitizedAcpxEnvironment(
     retainedBytes += entryBytes;
     result[key] = value;
   }
-  return result;
+  return Object.freeze({
+    env: Object.freeze(result),
+  }) as SanitizedAcpxSpawnInput;
 }

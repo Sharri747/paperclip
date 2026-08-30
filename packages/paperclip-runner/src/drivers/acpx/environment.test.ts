@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { createSanitizedAcpxEnvironment } from "./environment.js";
+import { createSanitizedAcpxSpawnInput } from "./environment.js";
 
 describe("ACPX launch environment", () => {
   it("projects only the selected agent's credentials and runtime allowlist", () => {
@@ -16,32 +16,36 @@ describe("ACPX launch environment", () => {
       UNRELATED_SECRET: "not-visible",
     };
 
-    expect(createSanitizedAcpxEnvironment(source, "codex")).toEqual({
+    const codex = createSanitizedAcpxSpawnInput(source, "codex");
+    expect(codex.env).toEqual({
       PATH: "/bin",
       LC_ALL: "C.UTF-8",
       HTTPS_PROXY: "https://proxy.example",
       OPENAI_API_KEY: "openai-secret",
     });
-    expect(createSanitizedAcpxEnvironment(source, "claude")).toEqual({
+    expect(createSanitizedAcpxSpawnInput(source, "claude").env).toEqual({
       PATH: "/bin",
       LC_ALL: "C.UTF-8",
       HTTPS_PROXY: "https://proxy.example",
       ANTHROPIC_API_KEY: "anthropic-secret",
     });
-    expect(createSanitizedAcpxEnvironment(source, "pi")).toEqual({
+    expect(createSanitizedAcpxSpawnInput(source, "pi").env).toEqual({
       PATH: "/bin",
       LC_ALL: "C.UTF-8",
       HTTPS_PROXY: "https://proxy.example",
       OPENROUTER_API_KEY: "openrouter-secret",
     });
+    expect(codex.env).not.toHaveProperty("PAPERCLIP_NATIVE_MCP_TOKEN");
+    expect(Object.isFrozen(codex)).toBe(true);
+    expect(Object.isFrozen(codex.env)).toBe(true);
   });
 
   it("rejects unsafe or unbounded retained values", () => {
     expect(() =>
-      createSanitizedAcpxEnvironment({ PATH: "bad\0path" }, "codex"),
+      createSanitizedAcpxSpawnInput({ PATH: "bad\0path" }, "codex"),
     ).toThrow("null byte");
     expect(() =>
-      createSanitizedAcpxEnvironment(
+      createSanitizedAcpxSpawnInput(
         {
           OPENAI_API_KEY: "x".repeat(64 * 1024),
         },
