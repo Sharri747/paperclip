@@ -141,6 +141,16 @@ test("the ACPX question fixture enforces its provider-native contract", async ()
     /native response option for environment/,
   );
 
+  const patternBearingQuestion = structuredClone(canonical);
+  const patternBearingProperty = patternBearingQuestion.nativeRequest.params
+    .requestedSchema.properties.environment;
+  delete patternBearingProperty.oneOf;
+  patternBearingProperty.pattern = "^staging$";
+  assert.throws(
+    () => assertAcpxQuestionFixture(patternBearingQuestion),
+    /native string property environment uses an unsupported pattern/,
+  );
+
   const emptyOption = structuredClone(canonical);
   emptyOption.nativeRequest.params.requestedSchema.properties.environment
     .oneOf[0].const = "";

@@ -480,6 +480,12 @@ function projectAcpxProperty(name, property, index, required) {
   if (property.type === "string") {
     const options = acpxNativeOptions(property, "oneOf");
     if (options.length > 0) return projectedAcpxOptions(name, property.type, base, options, "single_select");
+    if (optionalFixtureText(property.pattern) !== undefined) {
+      throw contractError(
+        "invalid_acpx_question_fixture",
+        `native string property ${name} uses an unsupported pattern`,
+      );
+    }
     return {
       name,
       type: property.type,
@@ -494,9 +500,6 @@ function projectAcpxProperty(name, property, index, required) {
             : {}),
           ...(finiteNonNegativeFixtureInteger(property.maxLength) !== undefined
             ? { maxLength: property.maxLength }
-            : {}),
-          ...(optionalFixtureText(property.pattern) !== undefined
-            ? { pattern: property.pattern }
             : {}),
         },
       },
