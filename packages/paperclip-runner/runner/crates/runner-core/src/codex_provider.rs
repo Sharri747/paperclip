@@ -396,7 +396,6 @@ impl CodexProvider {
         // Attempting replacement work is a post-terminal liveness observation.
         // Preserve the prior durable result until a replacement turn identity
         // is accepted, but do not let it hide a crash during this request.
-        let prior_reconciliation_pending = self.completion_reconciliation_pending;
         let prior_buffered_message_count = self.pending_messages.len();
         self.completion_reconciliation_pending = false;
         self.ambiguous_turn_start_pending = true;
@@ -413,6 +412,9 @@ impl CodexProvider {
             Ok(result) => result,
             Err(ProviderRequestError::Rejected(error)) => {
                 // A definite rejection proves no replacement work began.
+                // The response still proves the process remained live after
+                // the prior terminal, so that terminal cannot reconcile a
+                // later nonzero exit.
                 // Only diagnostics without provider-work identity belong to
                 // that rejected request. Contradictory turn/item evidence or
                 // a server request must still revoke reconciliation so the
@@ -431,7 +433,6 @@ impl CodexProvider {
                     {
                         buffered.revokes_completion_reconciliation = false;
                     }
-                    self.completion_reconciliation_pending = prior_reconciliation_pending;
                 }
                 return Err(error);
             }

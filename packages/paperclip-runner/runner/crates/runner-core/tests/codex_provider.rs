@@ -568,7 +568,7 @@ fn post_completion_observation_does_not_hide_same_or_resumed_process_failure() {
 }
 
 #[test]
-fn rejected_replacement_turn_start_preserves_prior_completion_authority() {
+fn rejected_replacement_turn_start_preserves_result_but_not_exit_authority() {
     let directory = temporary_directory("completion-then-rejected-turn-start");
     let config = provider_config(&directory, &["--reject-second-turn-start"]);
     let mut provider = CodexProvider::start(&config, None).expect("start Codex provider");
@@ -618,7 +618,7 @@ fn rejected_replacement_turn_start_preserves_prior_completion_authority() {
         }
     });
     assert!(buffered_notification_seen);
-    assert_eq!(rejected_start_exit, Some((false, true, true)));
+    assert_eq!(rejected_start_exit, Some((false, true, false)));
 
     fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
 }
