@@ -1278,16 +1278,61 @@ impl CodexCommandExecutor {
             state.ambiguous_turn_start_pending = true;
         }
         self.save_state()?;
-        let (start_result, completion_authority_retained, ambiguous_turn_start_pending) = {
+        let (
+            start_result,
+            completion_authority_retained,
+            ambiguous_turn_start_pending,
+            rejected_accepted_turn_id,
+        ) = {
             let provider = self.ensure_provider()?;
             let result = provider.start_turn(text, &cwd);
             (
                 result,
                 provider.completed_turn_authority().is_some(),
                 provider.ambiguous_turn_start_pending(),
+                provider.take_rejected_accepted_provider_turn_id(),
             )
         };
         if let Err(error) = start_result {
+            if let Some(provider_turn_id) = rejected_accepted_turn_id {
+                // Codex accepted this work before disclosing a reused durable
+                // identity. The provider has already been terminated; close
+                // this run before returning so recovery cannot resume the
+                // untracked turn from the provider's thread snapshot.
+                self.provider = None;
+                let state = self
+                    .state
+                    .as_mut()
+                    .expect("Codex state remains available after reused turn acceptance");
+                state.active_provider_turn_id = None;
+                state.ambiguous_turn_start_pending = false;
+                state.completed_turn_authoritative = false;
+                state.completed_turn_process_generation = None;
+                state.completed_provider_turn_id = None;
+                state.receipt_limit_diagnostic_emitted = false;
+                state.receipt_limit_interrupt_pending = false;
+                state.receipt_limit_interrupt_accepted = false;
+                state.receipt_limit_interrupt_attempts = 0;
+                state.receipt_limit_interrupt_deadline_unix_ms = None;
+                state.last_agent_message = None;
+                state.lifecycle = "closed".to_owned();
+                state.push_terminal_event(NormalizedProviderEvent {
+                    event_type: "harness.diagnostic".to_owned(),
+                    priority: EventPriority::P0,
+                    payload: json!({
+                        "provider": "codex",
+                        "code": "provider_turn_identity_reused",
+                        "providerTurnId": provider_turn_id,
+                        "message": "Codex accepted work with a previously settled turn identity; Paperclip terminated the provider and closed the durable run",
+                        "paperclipAccepted": false,
+                        "providerAccepted": true,
+                    }),
+                })?;
+                self.save_state()?;
+                return Err(DurableRunnerError::invalid(format!(
+                    "Codex turn/start failed closed after accepted identity reuse: {error}"
+                )));
+            }
             let state = self
                 .state
                 .as_mut()

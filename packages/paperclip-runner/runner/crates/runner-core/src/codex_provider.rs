@@ -17,6 +17,8 @@ const MAX_BUFFERED_MESSAGES: usize = 1_024;
 const MAX_INSTRUCTIONS_BYTES: usize = 1024 * 1024;
 const MAX_PENDING_TOOL_REQUESTS: usize = 4_096;
 const MAX_PENDING_TOOL_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+const MAX_PENDING_RUNTIME_REQUESTS: usize = 128;
+const MAX_PENDING_RUNTIME_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const MAX_SETTLED_PROVIDER_TURN_IDS: usize = 4_096;
 type QuestionOptionLabels = BTreeMap<String, BTreeMap<String, String>>;
 type QuestionSetMapping = (String, Value, QuestionOptionLabels);
@@ -215,6 +217,7 @@ struct PendingRuntimeRequest {
     params: Value,
     question_set: Value,
     option_labels: QuestionOptionLabels,
+    retained_bytes: usize,
 }
 
 struct BufferedProviderMessage {
@@ -241,6 +244,7 @@ pub struct CodexProvider {
     pending_tool_requests: BTreeMap<String, PendingToolRequest>,
     pending_tool_request_bytes: usize,
     pending_runtime_requests: BTreeMap<String, PendingRuntimeRequest>,
+    pending_runtime_request_bytes: usize,
     runtime_request_scope: [u8; 16],
     next_runtime_request_sequence: u64,
     expected_shutdown: bool,
@@ -249,6 +253,7 @@ pub struct CodexProvider {
     completion_reconciliation_pending: bool,
     ambiguous_turn_start_pending: bool,
     settled_provider_turn_ids: SettledProviderTurnIds,
+    rejected_accepted_provider_turn_id: Option<String>,
 }
 
 impl CodexProvider {
@@ -297,6 +302,7 @@ impl CodexProvider {
             pending_tool_requests: BTreeMap::new(),
             pending_tool_request_bytes: 0,
             pending_runtime_requests: BTreeMap::new(),
+            pending_runtime_request_bytes: 0,
             runtime_request_scope: new_runtime_request_scope()?,
             next_runtime_request_sequence: 1,
             expected_shutdown: false,
@@ -305,6 +311,7 @@ impl CodexProvider {
             completion_reconciliation_pending: false,
             ambiguous_turn_start_pending: false,
             settled_provider_turn_ids: SettledProviderTurnIds::default(),
+            rejected_accepted_provider_turn_id: None,
         };
         let initialized = provider.request(
             "initialize",
@@ -439,6 +446,10 @@ impl CodexProvider {
         self.settled_provider_turn_ids.limit_reached()
     }
 
+    pub(crate) fn take_rejected_accepted_provider_turn_id(&mut self) -> Option<String> {
+        self.rejected_accepted_provider_turn_id.take()
+    }
+
     pub fn start_turn(&mut self, message: &str, cwd: &str) -> Result<Value, LocalRunnerError> {
         if self.active_provider_turn_id.is_some() {
             return Err(LocalRunnerError::invalid(
@@ -514,8 +525,19 @@ impl CodexProvider {
             "Codex turn id",
         )?;
         if self.settled_provider_turn_ids.contains(&provider_turn_id) {
+            // The provider accepted work before returning its identity. A
+            // duplicate identity therefore cannot be handled as an ordinary
+            // rejected request: terminate the process so the untracked turn
+            // cannot continue mutating the workspace, and let the durable
+            // backend close this run before reporting the error.
+            self.rejected_accepted_provider_turn_id = Some(provider_turn_id.clone());
+            self.expected_shutdown = true;
+            self.completed_turn_authority = None;
+            self.completion_reconciliation_pending = false;
+            let _ = self.cancel_pending_requests();
+            let _ = self.process.terminate_group();
             return Err(LocalRunnerError::invalid(
-                "Codex reused a settled provider turn identity",
+                "Codex reused a settled provider turn identity after accepting work; the provider was terminated",
             ));
         }
         // Only a validated provider turn identity proves that replacement
@@ -647,7 +669,11 @@ impl CodexProvider {
         let result = codex_question_response(&pending, response)?;
         self.process
             .send(&json!({"id": pending.rpc_id, "result": result}))?;
-        self.pending_runtime_requests.remove(request_id);
+        if let Some(completed) = self.pending_runtime_requests.remove(request_id) {
+            self.pending_runtime_request_bytes = self
+                .pending_runtime_request_bytes
+                .saturating_sub(completed.retained_bytes);
+        }
         Ok(())
     }
 
@@ -912,6 +938,14 @@ impl CodexProvider {
                 }
                 let (provider_request_id, question_set, option_labels) =
                     codex_question_set(&rpc_id, &params)?;
+                let retained_bytes = pending_runtime_request_size(
+                    &rpc_id,
+                    &active_turn_id,
+                    method,
+                    &params,
+                    &question_set,
+                    &option_labels,
+                )?;
                 let pending = PendingRuntimeRequest {
                     rpc_id: rpc_id.clone(),
                     turn_id: active_turn_id.clone(),
@@ -919,6 +953,7 @@ impl CodexProvider {
                     params,
                     question_set: question_set.clone(),
                     option_labels,
+                    retained_bytes,
                 };
                 if let Some(existing) = self
                     .pending_runtime_requests
@@ -931,6 +966,28 @@ impl CodexProvider {
                         ));
                     }
                     return Ok(None);
+                }
+                let retained_request_bytes = retain_pending_runtime_request_bytes(
+                    self.pending_runtime_request_bytes,
+                    retained_bytes,
+                );
+                if self.pending_runtime_requests.len() >= MAX_PENDING_RUNTIME_REQUESTS
+                    || retained_request_bytes.is_none()
+                {
+                    self.process.send(&json!({
+                        "id": rpc_id,
+                        "error": {
+                            "code": -32000,
+                            "message": "Paperclip rejected this runtime request because the pending input capacity was reached",
+                        },
+                    }))?;
+                    return Ok(Some(CodexProviderEvent::Notification {
+                        method: "warning".to_owned(),
+                        params: json!({
+                            "message": "rejected a Codex runtime request at the bounded pending-input limit",
+                            "providerMethod": "item/tool/requestUserInput",
+                        }),
+                    }));
                 }
                 let request_sequence = self.next_runtime_request_sequence;
                 self.next_runtime_request_sequence = self
@@ -947,6 +1004,8 @@ impl CodexProvider {
                 );
                 self.pending_runtime_requests
                     .insert(request_id.clone(), pending);
+                self.pending_runtime_request_bytes =
+                    retained_request_bytes.expect("bounded runtime request bytes checked above");
                 return Ok(Some(CodexProviderEvent::RuntimeRequest {
                     request_id,
                     question_set,
@@ -1074,6 +1133,7 @@ impl CodexProvider {
     fn cancel_pending_requests(&mut self) -> Result<(), LocalRunnerError> {
         let pending_runtime = std::mem::take(&mut self.pending_runtime_requests);
         let pending = std::mem::take(&mut self.pending_tool_requests);
+        self.pending_runtime_request_bytes = 0;
         self.pending_tool_request_bytes = 0;
         let mut first_error = None;
         for request in pending_runtime.into_values() {
@@ -1178,6 +1238,29 @@ fn retain_pending_tool_request_bytes(
                 "Codex pending tool requests exceed the 16 MiB aggregate limit",
             )
         })
+}
+
+fn pending_runtime_request_size(
+    rpc_id: &Value,
+    turn_id: &str,
+    method: &str,
+    params: &Value,
+    question_set: &Value,
+    option_labels: &QuestionOptionLabels,
+) -> Result<usize, LocalRunnerError> {
+    serde_json::to_vec(&(rpc_id, turn_id, method, params, question_set, option_labels))
+        .map(|encoded| encoded.len())
+        .map_err(|error| {
+            LocalRunnerError::invalid(format!(
+                "Codex pending runtime request is not serializable: {error}"
+            ))
+        })
+}
+
+fn retain_pending_runtime_request_bytes(current: usize, incoming: usize) -> Option<usize> {
+    current
+        .checked_add(incoming)
+        .filter(|total| *total <= MAX_PENDING_RUNTIME_REQUEST_BYTES)
 }
 
 fn codex_dynamic_tools(
@@ -1664,6 +1747,7 @@ mod tests {
             params: Value::Null,
             question_set,
             option_labels: labels,
+            retained_bytes: 0,
         };
         let native = codex_question_response(
             &pending,
@@ -1833,5 +1917,18 @@ mod tests {
         assert!(retain_pending_tool_request_bytes(MAX_PENDING_TOOL_REQUEST_BYTES, 1).is_err());
         assert!(retain_pending_tool_request_bytes(usize::MAX, 1).is_err());
         assert!(pending_tool_request_size([usize::MAX, 1]).is_err());
+    }
+
+    #[test]
+    fn bounds_all_retained_runtime_request_data_in_aggregate() {
+        assert_eq!(
+            retain_pending_runtime_request_bytes(MAX_PENDING_RUNTIME_REQUEST_BYTES - 10, 10,),
+            Some(MAX_PENDING_RUNTIME_REQUEST_BYTES)
+        );
+        assert_eq!(
+            retain_pending_runtime_request_bytes(MAX_PENDING_RUNTIME_REQUEST_BYTES, 1),
+            None
+        );
+        assert_eq!(retain_pending_runtime_request_bytes(usize::MAX, 1), None);
     }
 }

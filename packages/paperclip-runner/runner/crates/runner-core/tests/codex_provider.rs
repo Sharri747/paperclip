@@ -149,6 +149,20 @@ fn wait_for_notification(provider: &mut CodexProvider, expected_method: &str) ->
     panic!("did not observe Codex {expected_method} notification before the deadline");
 }
 
+fn wait_for_provider_exit(provider: &mut CodexProvider) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if matches!(
+            provider.poll().expect("poll terminated provider"),
+            Some(CodexProviderEvent::Exited { .. })
+        ) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    panic!("the provider accepted a reused turn identity but remained live");
+}
+
 fn saturate_provider_tool_receipts(directory: &Path) {
     let mut bridge = ProviderToolBridge::default();
     bridge.prepare(task_context_tool_set()).unwrap();
@@ -1590,8 +1604,8 @@ fn codex_fails_closed_when_a_provider_reuses_a_settled_turn_id() {
         .expect_err("reject a provider turn with a reused identity");
     assert!(error.to_string().contains("reused a settled"));
     assert_eq!(provider.active_provider_turn_id(), None);
+    wait_for_provider_exit(&mut provider);
 
-    let _ = provider.shutdown();
     fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
 }
 
@@ -1613,8 +1627,8 @@ fn codex_fails_closed_when_a_provider_reuses_an_older_settled_turn_id() {
         .expect_err("reject a provider turn with an older reused identity");
     assert!(error.to_string().contains("reused a settled"));
     assert_eq!(provider.active_provider_turn_id(), None);
+    wait_for_provider_exit(&mut provider);
 
-    let _ = provider.shutdown();
     fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
 }
 
@@ -1674,7 +1688,31 @@ fn durable_backend_rejects_an_older_provider_turn_id_after_restart() {
         .expect_err("reject a provider turn identity retained before restart");
     assert!(error.to_string().contains("reused a settled"));
 
-    recovered.shutdown().expect("stop recovered provider");
+    let persisted: Value = serde_json::from_slice(
+        &fs::read(directory.join("codex-provider-state.json"))
+            .expect("read fail-closed provider state"),
+    )
+    .expect("parse fail-closed provider state");
+    assert_eq!(persisted["lifecycle"], "closed");
+    assert!(persisted["activeProviderTurnId"].is_null());
+
+    drop(recovered);
+    let resumes_before_closed_restore = call_count(&directory, "thread/resume");
+    let mut closed = CodexCommandExecutor::with_runner_config(&directory, &runner_config);
+    let events = closed
+        .poll_events()
+        .expect("closed reused-identity state remains readable without resuming Codex");
+    assert!(events.iter().any(|event| {
+        event.event_type == "harness.diagnostic"
+            && event.payload["code"] == "provider_turn_identity_reused"
+    }));
+    assert_eq!(
+        call_count(&directory, "thread/resume"),
+        resumes_before_closed_restore,
+        "recovery must not resume provider work accepted under a reused identity"
+    );
+
+    closed.shutdown().expect("close fail-closed executor");
     fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
 }
 
@@ -2816,6 +2854,72 @@ fn receipt_limit_polls_an_authoritative_terminal_with_unacknowledged_events() {
     recovered
         .acknowledge_events(terminal.len())
         .expect("acknowledge the diagnostic and authoritative terminal together");
+
+    recovered.shutdown().expect("stop recovered provider");
+    fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
+}
+
+#[test]
+fn receipt_limit_polling_bounds_and_rejects_runtime_request_floods() {
+    let directory = temporary_directory("receipt-limit-runtime-request-flood");
+    let config = provider_config(
+        &directory,
+        &[
+            "--require-dynamic-tool",
+            "--hold-turn",
+            "--emit-tool-call-on-resume",
+            "--accept-interrupt-without-terminal",
+            "--flood-runtime-requests-on-interrupt",
+        ],
+    );
+    let runner_config = durable_config(&directory);
+    let mut first = CodexCommandExecutor::with_runner_config(&directory, &runner_config);
+    first
+        .execute(&command(
+            "prepare",
+            1,
+            "run.prepare",
+            json!({
+                "provider": config,
+                "authorizedTools": task_context_tool_set(),
+            }),
+        ))
+        .expect("prepare Codex provider");
+    first
+        .execute(&command("open", 2, "session.open", json!({})))
+        .expect("open Codex session");
+    first
+        .execute(&command(
+            "turn",
+            3,
+            "turn.start",
+            json!({"text": "Bound runtime requests while stopping this turn."}),
+        ))
+        .expect("start held provider turn");
+    drop(first);
+    saturate_provider_tool_receipts(&directory);
+
+    let mut recovered = CodexCommandExecutor::with_runner_config(&directory, &runner_config);
+    for _ in 0..4 {
+        let events = recovered
+            .poll_events()
+            .expect("runtime-request cleanup remains bounded across repeated polls");
+        assert!(events.len() <= 128);
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while call_count(&directory, "runtime-response:rejected") == 0
+        && std::time::Instant::now() < deadline
+    {
+        recovered
+            .poll_events()
+            .expect("continue bounded receipt-limit cleanup polling");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(
+        call_count(&directory, "runtime-response:rejected") > 0,
+        "requests above the pending count/byte envelope are rejected instead of retained"
+    );
 
     recovered.shutdown().expect("stop recovered provider");
     fs::remove_dir_all(directory).expect("remove Codex integration-test directory");

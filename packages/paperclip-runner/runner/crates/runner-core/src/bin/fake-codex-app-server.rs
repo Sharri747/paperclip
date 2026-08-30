@@ -144,6 +144,30 @@ fn send_question(state: &FakeState) -> io::Result<()> {
     }))
 }
 
+fn send_runtime_request_flood(state: &FakeState, interrupt_count: u64) -> io::Result<()> {
+    let turn_id = state.active_turn_id.as_deref().unwrap_or("provider-turn-1");
+    for index in 0..160_u64 {
+        send(json!({
+            "id": format!("runtime-flood-{interrupt_count}-{index}"),
+            "method": "item/tool/requestUserInput",
+            "params": {
+                "threadId": state.thread_id,
+                "turnId": turn_id,
+                "itemId": format!("question-item-{interrupt_count}-{index}"),
+                "isBlocking": true,
+                "title": "Bounded cleanup input",
+                "questions": [{
+                    "id": "environment",
+                    "header": "Environment",
+                    "question": "Where should we deploy?",
+                    "options": [{"label": "Staging", "description": "Deploy safely."}],
+                }],
+            },
+        }))?;
+    }
+    Ok(())
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let state_path =
@@ -223,6 +247,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let accept_interrupt_without_terminal = args
         .iter()
         .any(|value| value == "--accept-interrupt-without-terminal");
+    let flood_runtime_requests_on_interrupt = args
+        .iter()
+        .any(|value| value == "--flood-runtime-requests-on-interrupt");
     let interrupt_terminal_delay_ms = argument(&args, "--interrupt-terminal-delay-ms")
         .map(|value| value.parse::<u64>())
         .transpose()?;
@@ -265,6 +292,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     for line in io::stdin().lock().lines() {
         let message: Value = serde_json::from_str(&line?)?;
+        if message.get("method").is_none()
+            && message
+                .get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id.starts_with("runtime-flood-"))
+        {
+            let outcome = if message.get("error").is_some() {
+                "runtime-response:rejected"
+            } else {
+                "runtime-response:cancelled"
+            };
+            log_call(call_log.as_deref(), outcome)?;
+            continue;
+        }
         if message.get("method").is_none() && message.get("id") == Some(&json!("runtime-request-1"))
         {
             if reuse_question_id && answered_questions == 0 {
@@ -646,6 +687,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }))?;
                 } else {
                     send(json!({"id": id, "result": {"accepted": true}}))?;
+                    if flood_runtime_requests_on_interrupt {
+                        send_runtime_request_flood(&state, interrupt_count)?;
+                    }
                     if !accept_interrupt_without_terminal
                         && !(accept_interrupt_without_terminal_once
                             && interrupt_count == if fail_first_interrupt { 2 } else { 1 })
