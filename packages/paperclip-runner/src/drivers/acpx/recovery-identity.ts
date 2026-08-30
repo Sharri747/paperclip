@@ -131,7 +131,7 @@ export function verifyExpectedAcpxIdentity(
     ? null
     : parsePersistedRecord(persisted, binding);
   const expectedPermissionMode = expected.permissionMode ?? "approve-reads";
-  const acceptedControllerProfileDigests = parsed?.usesLegacyProfileDigest
+  const acceptedControllerProfileDigests = parsed?.schemaLessLegacy
     ? [binding.profileDigest, binding.legacyProfileDigest]
     : [binding.profileDigest];
   if (
@@ -150,7 +150,7 @@ export function verifyExpectedAcpxIdentity(
 
   const persistedRecord = parsed!;
   const { record } = persistedRecord;
-  const persistedProfileDigest = persistedRecord.usesLegacyProfileDigest
+  const persistedProfileDigest = persistedRecord.schemaLessLegacy
     ? binding.legacyProfileDigest
     : binding.profileDigest;
   if (
@@ -173,7 +173,7 @@ export function verifyExpectedAcpxIdentity(
 function parsePersistedRecord(
   value: unknown,
   binding: AcpxRecoveryBinding,
-): { record: AcpxIdentityRecord; usesLegacyProfileDigest: boolean } {
+): { record: AcpxIdentityRecord; schemaLessLegacy: boolean } {
   const record = object(value);
   if (record.schema === undefined) {
     rejectUnknownKeys(record, [
@@ -202,7 +202,7 @@ function parsePersistedRecord(
         workspaceDigest: binding.workspaceDigest,
         permissionMode: legacyPermissionMode,
       }),
-      usesLegacyProfileDigest: true,
+      schemaLessLegacy: true,
     };
   }
   rejectUnknownKeys(record, [
@@ -220,13 +220,10 @@ function parsePersistedRecord(
   const validated = validatedRecord(record);
   return {
     record: validated,
-    // Early v1 writers used the command digest before the recovery identity
-    // was expanded to cover the complete qualified profile. The wire shape
-    // and schema stayed the same, so the digest itself is the only reliable
-    // discriminator. Preserve those records without weakening fresh records:
-    // every other v1 digest is still checked against the composite digest.
-    usesLegacyProfileDigest:
-      validated.profileDigest === binding.legacyProfileDigest,
+    // A schema-bearing v1 record must prove the complete qualified-profile
+    // binding. A command digest cannot distinguish an early writer from
+    // immutable metadata drift, so it is never a safe downgrade signal.
+    schemaLessLegacy: false,
   };
 }
 

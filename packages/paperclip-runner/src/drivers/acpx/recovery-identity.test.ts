@@ -167,7 +167,7 @@ describe("ACPX recovery identity", () => {
     ).toThrow(/historical approve-reads policy/);
   });
 
-  it("reads an early v1 record that used the command digest", async () => {
+  it("rejects early v1 command digests across qualified-profile drift", async () => {
     const fixture = await recoveryFixture();
     const earlyV1 = {
       ...createAcpxIdentityRecord(fixture.expected, fixture.binding),
@@ -176,7 +176,7 @@ describe("ACPX recovery identity", () => {
 
     expect(() =>
       verifyExpectedAcpxIdentity(fixture.expected, fixture.binding, earlyV1),
-    ).not.toThrow();
+    ).toThrow(/persisted runtime record/);
     expect(() =>
       verifyExpectedAcpxIdentity(
         {
@@ -186,12 +186,30 @@ describe("ACPX recovery identity", () => {
         fixture.binding,
         earlyV1,
       ),
-    ).not.toThrow();
+    ).toThrow(/immutable session configuration/);
+
+    const changedBinding = await createAcpxRecoveryBinding({
+      ...fixture.input,
+      profile: {
+        ...fixture.input.profile,
+        agentRuntimeVersion: "99.0.0",
+      },
+    });
+    expect(changedBinding.legacyProfileDigest).toBe(
+      fixture.binding.legacyProfileDigest,
+    );
+    expect(changedBinding.profileDigest).not.toBe(
+      fixture.binding.profileDigest,
+    );
     expect(() =>
-      verifyExpectedAcpxIdentity(fixture.expected, fixture.binding, {
-        ...earlyV1,
-        profileDigest: digest("different"),
-      }),
+      verifyExpectedAcpxIdentity(
+        {
+          ...fixture.expected,
+          profileDigest: changedBinding.profileDigest,
+        },
+        changedBinding,
+        earlyV1,
+      ),
     ).toThrow(/persisted runtime record/);
   });
 
