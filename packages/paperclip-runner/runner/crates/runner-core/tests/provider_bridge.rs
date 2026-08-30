@@ -741,15 +741,6 @@ fn reserves_identity_capacity_before_accepting_a_call() {
     bridge
         .begin_call("last-call".into(), "get_task_context".into(), json!({}))
         .unwrap();
-    bridge
-        .apply_result(ToolResult {
-            call_id: "last-call".into(),
-            operation_id: "get_task_context".into(),
-            result: json!({"ok": true}),
-            is_error: false,
-        })
-        .unwrap();
-    bridge.settle_turn("provider_turn_terminated").unwrap();
 
     let error = bridge
         .begin_call("overflow".into(), "get_task_context".into(), json!({}))
@@ -761,11 +752,92 @@ fn reserves_identity_capacity_before_accepting_a_call() {
     recovered.attach_existing_run().unwrap();
     recovered
         .settle_turn("provider_turn_terminated")
-        .expect("the controlled turn stop releases the prior identity epoch");
-    assert!(!recovered.has_completed_call("settled-0"));
+        .expect("the controlled turn stop retains every identity in this run");
+    assert!(recovered.durable_run_receipt_limit_reached());
+    assert!(recovered.has_completed_call("settled-0"));
+    assert!(recovered.has_completed_call("last-call"));
+    let stopped_turn_receipt = recovered
+        .replay_result("last-call", "get_task_context", &json!({}))
+        .unwrap()
+        .expect("the call admitted before exhaustion retains an exact terminal receipt");
+    assert!(stopped_turn_receipt.is_error);
+    assert_eq!(
+        stopped_turn_receipt.result["error"]["code"],
+        "provider_turn_terminated"
+    );
+    assert!(recovered
+        .begin_call("settled-0".into(), "get_task_context".into(), json!({}))
+        .is_err());
+    assert!(recovered
+        .begin_call("overflow".into(), "get_task_context".into(), json!({}))
+        .is_err());
+
+    recovered.attach_run(tools("computed")).unwrap();
+    assert!(!recovered.durable_run_receipt_limit_reached());
     recovered
         .begin_call("overflow".into(), "get_task_context".into(), json!({}))
-        .expect("a later turn can use semantic tools after the controlled stop");
+        .expect("a new durable run receives a fresh tool-call identity ledger");
+}
+
+#[test]
+fn settled_result_byte_exhaustion_requires_a_new_run() {
+    let mut bridge = ProviderToolBridge::default();
+    bridge.prepare(tools("computed")).unwrap();
+    let large_result = json!({"value": "x".repeat(750 * 1024)});
+
+    for index in 0..10 {
+        let call_id = format!("large-settled-{index}");
+        bridge
+            .begin_call(call_id.clone(), "get_task_context".into(), json!({}))
+            .unwrap();
+        bridge
+            .apply_result(ToolResult {
+                call_id,
+                operation_id: "get_task_context".into(),
+                result: large_result.clone(),
+                is_error: false,
+            })
+            .unwrap();
+    }
+    bridge.settle_turn("provider_turn_terminated").unwrap();
+
+    let error = bridge
+        .begin_call(
+            "over-byte-limit".into(),
+            "get_task_context".into(),
+            json!({}),
+        )
+        .expect_err("settled byte exhaustion must stop the durable run");
+    assert!(error.is_active_turn_receipt_limit());
+
+    let encoded = serde_json::to_string(&bridge).unwrap();
+    let mut recovered: ProviderToolBridge = serde_json::from_str(&encoded).unwrap();
+    recovered.attach_existing_run().unwrap();
+    assert!(recovered.durable_run_receipt_limit_reached());
+    assert_eq!(
+        recovered
+            .replay_result("large-settled-0", "get_task_context", &json!({}))
+            .unwrap()
+            .unwrap()
+            .result,
+        large_result
+    );
+    assert!(recovered
+        .begin_call(
+            "over-byte-limit".into(),
+            "get_task_context".into(),
+            json!({})
+        )
+        .is_err());
+
+    recovered.attach_run(tools("computed")).unwrap();
+    recovered
+        .begin_call(
+            "over-byte-limit".into(),
+            "get_task_context".into(),
+            json!({}),
+        )
+        .expect("a new durable run resets the settled result budget");
 }
 
 #[test]

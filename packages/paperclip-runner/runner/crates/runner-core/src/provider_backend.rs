@@ -1088,6 +1088,15 @@ impl CodexCommandExecutor {
         if self
             .state
             .as_ref()
+            .is_some_and(|state| state.tool_bridge.durable_run_receipt_limit_reached())
+        {
+            return Err(DurableRunnerError::invalid(
+                "the durable Codex run exhausted its semantic-tool receipt ledger; start a new run",
+            ));
+        }
+        if self
+            .state
+            .as_ref()
             .is_some_and(|state| state.active_provider_turn_id.is_some())
         {
             return Err(DurableRunnerError::invalid(
@@ -2529,6 +2538,60 @@ mod tests {
         assert!(error
             .to_string()
             .contains("until terminal events are acknowledged"));
+        assert!(executor.provider.is_none());
+    }
+
+    #[test]
+    fn exhausted_tool_receipts_require_a_new_durable_run() {
+        let operation = crate::provider_bridge::AuthorizedTool {
+            operation_id: "get_task_context".to_owned(),
+            version: 1,
+            description: "Read the active task context.".to_owned(),
+            input_schema: json!({"type": "object"}),
+            response_schema: json!({"type": "object"}),
+        };
+        let mut bridge = ProviderToolBridge::default();
+        bridge
+            .prepare(AuthorizedToolSet {
+                schema: TOOL_SET_SCHEMA.to_owned(),
+                schema_version: 1,
+                catalog_digest: authorized_tool_catalog_digest(std::slice::from_ref(&operation))
+                    .unwrap(),
+                operations: vec![operation],
+            })
+            .unwrap();
+        let mut encoded = serde_json::to_value(&bridge).unwrap();
+        encoded["durableRunReceiptLimitReached"] = Value::Bool(true);
+        let mut bridge: ProviderToolBridge = serde_json::from_value(encoded).unwrap();
+        bridge.attach_existing_run().unwrap();
+
+        let state = CodexProviderState::new(
+            CodexProviderConfig {
+                provider: "codex".to_owned(),
+                driver: "codex_app_server".to_owned(),
+                provider_version: "test".to_owned(),
+                command: PathBuf::from("codex"),
+                args: vec!["app-server".to_owned()],
+                cwd: std::env::current_dir()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                model: None,
+                provider_session_id: None,
+                instructions: String::new(),
+                approval_policy: "never".to_owned(),
+            },
+            None,
+            bridge,
+        );
+        let mut executor = CodexCommandExecutor::new(PathBuf::from("unused-test-state"));
+        executor.state = Some(state);
+        executor.restore_checked = true;
+
+        let error = executor
+            .start_turn(&json!({"text": "must not reach the provider"}))
+            .expect_err("an exhausted receipt ledger must reject later turns");
+        assert!(error.to_string().contains("start a new run"));
         assert!(executor.provider.is_none());
     }
 }

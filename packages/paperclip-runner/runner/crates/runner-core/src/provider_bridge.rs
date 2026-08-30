@@ -166,11 +166,15 @@ pub struct ProviderToolBridge {
     retained_result_bytes: usize,
     #[serde(default)]
     settled_call_ids: SettledCallIds,
-    // Once the run-wide identity ledger is full, the active turn must stop
-    // before older replay identities can be released. Persist this transition
-    // so recovery cannot leave semantic tools disabled forever.
-    #[serde(default, skip_serializing_if = "is_false")]
-    settled_history_reset_pending: bool,
+    // Exact tool-call identity is scoped to the durable run. Once its bounded
+    // receipt ledger is exhausted, stop the active turn and require a new run;
+    // clearing history in place would let an old provider call execute again.
+    #[serde(
+        default,
+        alias = "settledHistoryResetPending",
+        skip_serializing_if = "is_false"
+    )]
+    durable_run_receipt_limit_reached: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -218,7 +222,7 @@ impl ProviderToolBridge {
         self.settled_results.clear();
         self.retained_result_bytes = 0;
         self.settled_call_ids.clear();
-        self.settled_history_reset_pending = false;
+        self.durable_run_receipt_limit_reached = false;
         Ok(())
     }
 
@@ -275,7 +279,7 @@ impl ProviderToolBridge {
                 && self.completed.is_empty()
                 && self.settled_results.is_empty()
                 && self.settled_call_ids.is_empty()
-                && !self.settled_history_reset_pending
+                && !self.durable_run_receipt_limit_reached
             {
                 Ok(())
             } else {
@@ -317,18 +321,6 @@ impl ProviderToolBridge {
         {
             return Err(ProviderBridgeError::invalid(
                 "recovered provider tool bridge exceeds its durable call identity limit",
-            ));
-        }
-        if self.settled_history_reset_pending
-            && self
-                .settled_call_ids
-                .len()
-                .saturating_add(self.pending.len())
-                .saturating_add(self.completed.len())
-                < MAX_SETTLED_CALL_IDS
-        {
-            return Err(ProviderBridgeError::invalid(
-                "recovered provider tool bridge has an invalid settled history reset",
             ));
         }
         for call_id in self.settled_call_ids.iter() {
@@ -423,6 +415,10 @@ impl ProviderToolBridge {
         self.catalog_digest.is_some()
     }
 
+    pub fn durable_run_receipt_limit_reached(&self) -> bool {
+        self.durable_run_receipt_limit_reached
+    }
+
     pub fn replay_result(
         &self,
         call_id: &str,
@@ -495,6 +491,9 @@ impl ProviderToolBridge {
                 "provider reused a completed tool call id",
             ));
         }
+        if self.durable_run_receipt_limit_reached {
+            return Err(ProviderBridgeError::active_turn_receipt_limit());
+        }
         if self.pending.len() >= MAX_PENDING_CALLS {
             return Err(ProviderBridgeError::invalid(
                 "concurrent provider tool call limit reached",
@@ -523,7 +522,7 @@ impl ProviderToolBridge {
             .saturating_add(self.completed.len())
             >= MAX_SETTLED_CALL_IDS
         {
-            self.settled_history_reset_pending = true;
+            self.durable_run_receipt_limit_reached = true;
             return Err(ProviderBridgeError::active_turn_receipt_limit());
         }
         let result_reserve = self
@@ -532,8 +531,16 @@ impl ProviderToolBridge {
             .saturating_add(1)
             .checked_mul(MAX_TOOL_VALUE_BYTES)
             .ok_or_else(|| ProviderBridgeError::invalid("provider tool result reserve overflow"))?;
-        if self
-            .retained_value_bytes()?
+        let retained_value_bytes = self.retained_value_bytes()?;
+        if retained_value_bytes
+            .checked_add(input_bytes)
+            .and_then(|total| total.checked_add(MAX_TOOL_VALUE_BYTES))
+            .is_none_or(|total| total > MAX_RETAINED_TOOL_VALUE_BYTES)
+        {
+            self.durable_run_receipt_limit_reached = true;
+            return Err(ProviderBridgeError::active_turn_receipt_limit());
+        }
+        if retained_value_bytes
             .checked_add(input_bytes)
             .and_then(|total| total.checked_add(result_reserve))
             .is_none_or(|total| total > MAX_RETAINED_TOOL_VALUE_BYTES)
@@ -543,7 +550,15 @@ impl ProviderToolBridge {
         // Reserve the complete encoded receipt, including this exact input and
         // a maximum-sized result, before accepting work. An admitted call can
         // therefore always retain its authoritative result at settlement.
-        self.ensure_settled_result_capacity(Some(&call))?;
+        if ensure_settled_result_capacity(self.retained_result_bytes, std::iter::once(&call))
+            .is_err()
+        {
+            self.durable_run_receipt_limit_reached = true;
+            return Err(ProviderBridgeError::active_turn_receipt_limit());
+        }
+        if self.ensure_settled_result_capacity(Some(&call)).is_err() {
+            return Err(ProviderBridgeError::active_turn_receipt_limit());
+        }
         self.pending.insert(call_id, call.clone());
         Ok(call)
     }
@@ -670,26 +685,18 @@ impl ProviderToolBridge {
                 },
             );
         }
-        let next_retained_bytes = if self.settled_history_reset_pending {
-            retained_result_bytes(settled_entries.iter())?
-        } else {
-            retained_result_bytes(self.settled_results.iter().chain(settled_entries.iter()))?
-        };
+        let next_retained_bytes =
+            retained_result_bytes(self.settled_results.iter().chain(settled_entries.iter()))?;
         ensure_settled_result_capacity(next_retained_bytes, std::iter::empty())?;
 
         // Identity and byte capacity were reserved at admission. After the
         // preflight above, moving exact receipts cannot fail or strand a
         // terminal provider turn.
-        if self.settled_history_reset_pending {
-            // The controlled turn stop is the epoch boundary: calls from the
-            // stopped turn remain exact below, while older identities can no
-            // longer be replayed by that terminated provider turn.
-            self.settled_call_ids.clear();
-            self.settled_results.clear();
-            self.settled_history_reset_pending = false;
-        }
         self.settled_call_ids
             .extend_recent(settled_entries.keys().cloned(), MAX_SETTLED_CALL_IDS);
+        if self.settled_call_ids.len() >= MAX_SETTLED_CALL_IDS {
+            self.durable_run_receipt_limit_reached = true;
+        }
         self.pending.clear();
         self.completed.clear();
         self.settled_results.append(&mut settled_entries);
