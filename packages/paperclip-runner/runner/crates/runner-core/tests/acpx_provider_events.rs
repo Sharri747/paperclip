@@ -1,5 +1,6 @@
 use paperclip_runner_core::acpx_event_payload::AcpxRuntimeEventKind;
 use paperclip_runner_core::durable::EventPriority;
+use paperclip_runner_core::generated_acpx_sidecar_contract::classify_generated_acpx_tool_operation;
 use paperclip_runner_core::provider_events::normalize_acpx_runtime_event;
 use serde_json::json;
 
@@ -8,6 +9,27 @@ fn normalize(
     payload: serde_json::Value,
 ) -> Vec<paperclip_runner_core::provider_events::NormalizedProviderEvent> {
     normalize_acpx_runtime_event(kind, &payload, "event-7", "turn-1", 3)
+}
+
+#[test]
+fn generated_tool_classification_uses_ascii_case_mapping_for_kind_and_title() {
+    assert_eq!(
+        classify_generated_acpx_tool_operation("ſearch", ""),
+        "execute"
+    );
+    assert_eq!(
+        classify_generated_acpx_tool_operation("", "ſearch"),
+        "execute"
+    );
+    assert_eq!(
+        classify_generated_acpx_tool_operation("SEARCH", ""),
+        "search"
+    );
+    assert_eq!(classify_generated_acpx_tool_operation("", "WRITE"), "edit");
+    assert_eq!(
+        classify_generated_acpx_tool_operation(&format!("{}WRITE", "x".repeat(240)), ""),
+        "edit"
+    );
 }
 
 #[test]

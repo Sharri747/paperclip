@@ -45,6 +45,12 @@ export const GENERATED_ACPX_TOOL_OPERATION_PRECEDENCE = [
   { operation: "list", tokens: ["list", "glob"] },
 ] as const;
 
+function lowercaseGeneratedAcpxAscii(value: string): string {
+  return value.replace(/[A-Z]/g, (character) =>
+    String.fromCharCode(character.charCodeAt(0) + 32),
+  );
+}
+
 export function classifyGeneratedAcpxToolOperation(
   toolKind: unknown,
   toolTitle: unknown,
@@ -55,7 +61,7 @@ export function classifyGeneratedAcpxToolOperation(
       : typeof toolTitle === "string"
         ? toolTitle
         : "";
-  const normalized = candidate.toLowerCase();
+  const normalized = lowercaseGeneratedAcpxAscii(candidate);
   for (const { operation, tokens } of GENERATED_ACPX_TOOL_OPERATION_PRECEDENCE) {
     if (tokens.some((token) => normalized.includes(token))) return operation;
   }
