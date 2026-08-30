@@ -239,6 +239,113 @@ describe("Codex ACPX runtime adapter", () => {
     });
   });
 
+  it("retries retained admission cleanup after the first close times out", async () => {
+    let rejectHandshake: ((error: Error) => void) | undefined;
+    const blockedHandshake = new Promise<AcpRuntimeHandle>(
+      (_resolve, reject) => {
+        rejectHandshake = reject;
+      },
+    );
+    const runtime = fakeRuntime();
+    vi.mocked(runtime.ensureSession).mockReturnValue(blockedHandshake);
+    vi.mocked(runtime.close)
+      .mockImplementationOnce(() => new Promise<void>(() => undefined))
+      .mockResolvedValueOnce(undefined);
+    const controller = new AbortController();
+    const cancellation = new Error("runtime admission cancelled");
+    let runtimeOptions: AcpRuntimeOptions | undefined;
+
+    const opening = openCodexAcpxRuntime(
+      {
+        ...openOptions(fakeCommand()),
+        signal: controller.signal,
+      },
+      {
+        createRegistry: () => registry(),
+        createStore: () => store(),
+        createRuntime: (options) => {
+          runtimeOptions = options;
+          return runtime;
+        },
+        runtimeCloseTimeoutMs: 5,
+      },
+    );
+    await vi.waitFor(() =>
+      expect(runtime.ensureSession).toHaveBeenCalledOnce(),
+    );
+
+    controller.abort(cancellation);
+    await runtimeOptions!.sessionStore.save({
+      acpxRecordId: "late-record",
+      acpSessionId: "late-backend-session",
+      agentSessionId: "late-agent-session",
+      name: "late-runtime-name",
+      cwd: "/workspace",
+    } as never);
+
+    await expect(opening).rejects.toBe(cancellation);
+    expect(runtime.close).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(runtime.close).mock.calls[1]?.[0]).toEqual(
+      vi.mocked(runtime.close).mock.calls[0]?.[0],
+    );
+    rejectHandshake?.(new Error("test handshake stopped"));
+  });
+
+  it("surfaces the retry error when both retained admission closes fail", async () => {
+    let rejectHandshake: ((error: Error) => void) | undefined;
+    const blockedHandshake = new Promise<AcpRuntimeHandle>(
+      (_resolve, reject) => {
+        rejectHandshake = reject;
+      },
+    );
+    const runtime = fakeRuntime();
+    const firstCloseFailure = new Error("first close failed");
+    const retryCloseFailure = new Error("retry close failed");
+    vi.mocked(runtime.ensureSession).mockReturnValue(blockedHandshake);
+    vi.mocked(runtime.close)
+      .mockRejectedValueOnce(firstCloseFailure)
+      .mockRejectedValueOnce(retryCloseFailure);
+    const controller = new AbortController();
+    const cancellation = new Error("runtime admission cancelled");
+    let runtimeOptions: AcpRuntimeOptions | undefined;
+
+    const opening = openCodexAcpxRuntime(
+      {
+        ...openOptions(fakeCommand()),
+        signal: controller.signal,
+      },
+      {
+        createRegistry: () => registry(),
+        createStore: () => store(),
+        createRuntime: (options) => {
+          runtimeOptions = options;
+          return runtime;
+        },
+      },
+    );
+    await vi.waitFor(() =>
+      expect(runtime.ensureSession).toHaveBeenCalledOnce(),
+    );
+
+    controller.abort(cancellation);
+    await runtimeOptions!.sessionStore.save({
+      acpxRecordId: "late-record",
+      acpSessionId: "late-backend-session",
+      agentSessionId: "late-agent-session",
+      name: "late-runtime-name",
+      cwd: "/workspace",
+    } as never);
+
+    await expect(opening).rejects.toMatchObject({
+      errors: [cancellation, retryCloseFailure],
+    });
+    expect(runtime.close).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(runtime.close).mock.calls[1]?.[0]).toEqual(
+      vi.mocked(runtime.close).mock.calls[0]?.[0],
+    );
+    rejectHandshake?.(new Error("test handshake stopped"));
+  });
+
   it("aggregates asynchronous provider signal errors after a failed handshake", async () => {
     const child = failingSignalChild();
     const command = fakeCommand();

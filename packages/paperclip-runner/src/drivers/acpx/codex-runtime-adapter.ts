@@ -276,7 +276,6 @@ class RuntimeAdmissionCleanup {
       if (handle !== null) {
         const key = runtimeHandleCleanupKey(handle);
         if (!this.#closedHandles.has(key)) {
-          this.#closedHandles.add(key);
           const runtimeError = await closeRuntimeWithin(this.runtime, {
             input: {
               handle,
@@ -285,7 +284,13 @@ class RuntimeAdmissionCleanup {
             },
             timeoutMs: this.runtimeCloseTimeoutMs,
           });
-          if (runtimeError !== undefined) errors.push(runtimeError);
+          // A rejection or timeout does not prove the runtime released this
+          // identity. Leave it eligible for the next serialized cleanup pass.
+          if (runtimeError === undefined) {
+            this.#closedHandles.add(key);
+          } else {
+            errors.push(runtimeError);
+          }
         }
       }
       errors.push(...(await this.children.terminate()));
