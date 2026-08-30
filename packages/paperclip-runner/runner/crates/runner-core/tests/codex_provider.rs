@@ -655,6 +655,18 @@ fn rejected_replacement_turn_start_does_not_hide_contradictory_turn_evidence() {
             &config.cwd,
         )
         .expect_err("the replacement turn/start returns a definite rejection");
+    let duplicate_error = provider
+        .start_turn(
+            "Do not duplicate contradictory replacement work.",
+            &config.cwd,
+        )
+        .expect_err("provider-work evidence makes the rejected response ambiguous");
+    assert!(
+        duplicate_error
+            .to_string()
+            .contains("unresolved ambiguous provider turn start"),
+        "unexpected duplicate-start error: {duplicate_error}"
+    );
     let mut contradictory_turn_seen = false;
     let rejected_start_exit = (0..64).find_map(|_| {
         match provider
@@ -683,7 +695,11 @@ fn rejected_replacement_turn_start_does_not_hide_contradictory_turn_evidence() {
         }
     });
     assert!(contradictory_turn_seen);
-    assert_eq!(rejected_start_exit, Some((false, true, false)));
+    assert_eq!(
+        provider.active_provider_turn_id(),
+        Some("provider-turn-contradiction")
+    );
+    assert_eq!(rejected_start_exit, Some((false, false, false)));
 
     fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
 }
@@ -841,9 +857,9 @@ fn ambiguous_replacement_turn_adopts_one_later_completion_identity() {
                 _ => None,
             }
         });
-        assert_eq!(
-            replacement_started, !omit_started,
-            "the replacement identity should be established by the expected notification for {label}"
+        assert!(
+            replacement_started,
+            "the replacement identity should be established before replaying its output for {label}"
         );
         assert!(
             replacement_completed,
@@ -993,6 +1009,263 @@ fn ambiguous_replacement_start_preserves_durable_authority_before_exit() {
     assert!(!exit_events
         .iter()
         .any(|event| event == "session.reconciled"));
+
+    fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
+}
+
+#[test]
+fn durable_ambiguous_start_recovers_a_distinct_active_replacement_after_process_loss() {
+    let directory = temporary_directory("durable-ambiguous-active-recovery");
+    let config = provider_config(
+        &directory,
+        &[
+            "--fail-after-accepting-second-turn-before-response",
+            "--retain-ambiguous-second-turn-active",
+        ],
+    );
+    let mut executor = CodexCommandExecutor::new(&directory);
+    executor
+        .execute(&command(
+            "prepare",
+            1,
+            "run.prepare",
+            json!({"provider": config}),
+        ))
+        .expect("prepare Codex provider");
+    executor
+        .execute(&command("open", 2, "session.open", json!({})))
+        .expect("open Codex session");
+    executor
+        .execute(&command(
+            "first-turn",
+            3,
+            "turn.start",
+            json!({"text": "Complete the first turn."}),
+        ))
+        .expect("start first provider turn");
+    for _ in 0..32 {
+        if poll_and_ack(&mut executor)
+            .expect("poll first turn")
+            .iter()
+            .any(|event| event.event_type == "turn.completed")
+        {
+            break;
+        }
+    }
+
+    executor
+        .execute(&command(
+            "ambiguous-turn",
+            4,
+            "turn.start",
+            json!({"text": "Accept replacement work without returning its identity."}),
+        ))
+        .expect_err("replacement acceptance loses its response");
+    let persisted_ambiguous: Value = serde_json::from_slice(
+        &fs::read(directory.join("codex-provider-state.json"))
+            .expect("read provider state after ambiguous start"),
+    )
+    .expect("parse provider state after ambiguous start");
+    assert_eq!(persisted_ambiguous["ambiguousTurnStartPending"], true);
+    assert_eq!(
+        persisted_ambiguous["completedProviderTurnId"],
+        "provider-turn-1"
+    );
+
+    executor.shutdown().expect("stop first provider process");
+    drop(executor);
+
+    let mut recovered = CodexCommandExecutor::new(&directory);
+    let snapshot = recovered
+        .execute(&command("snapshot", 5, "session.snapshot", json!({})))
+        .expect("reconcile active replacement turn");
+    assert_eq!(snapshot.result["status"], "turn_active");
+    assert_eq!(snapshot.result["activeProviderTurnId"], "provider-turn-2");
+    let persisted_recovered: Value = serde_json::from_slice(
+        &fs::read(directory.join("codex-provider-state.json"))
+            .expect("read recovered provider state"),
+    )
+    .expect("parse recovered provider state");
+    assert_eq!(persisted_recovered["ambiguousTurnStartPending"], false);
+    assert_eq!(persisted_recovered["completedTurnAuthoritative"], false);
+    assert!(persisted_recovered["completedProviderTurnId"].is_null());
+
+    recovered
+        .shutdown()
+        .expect("stop recovered provider process");
+    fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
+}
+
+#[test]
+fn replacement_item_is_not_persisted_before_ambiguous_turn_identity() {
+    let directory = temporary_directory("durable-ambiguous-item-recovery");
+    let config = provider_config(
+        &directory,
+        &[
+            "--missing-id-second-turn-start",
+            "--hold-ambiguous-second-turn-after-item",
+        ],
+    );
+    let mut executor = CodexCommandExecutor::new(&directory);
+    executor
+        .execute(&command(
+            "prepare",
+            1,
+            "run.prepare",
+            json!({"provider": config}),
+        ))
+        .expect("prepare Codex provider");
+    executor
+        .execute(&command("open", 2, "session.open", json!({})))
+        .expect("open Codex session");
+    executor
+        .execute(&command(
+            "first-turn",
+            3,
+            "turn.start",
+            json!({"text": "Complete the first turn."}),
+        ))
+        .expect("start first provider turn");
+    for _ in 0..32 {
+        if poll_and_ack(&mut executor)
+            .expect("poll first turn")
+            .iter()
+            .any(|event| event.event_type == "turn.completed")
+        {
+            break;
+        }
+    }
+
+    executor
+        .execute(&command(
+            "ambiguous-turn",
+            4,
+            "turn.start",
+            json!({"text": "Emit replacement output before terminal authority."}),
+        ))
+        .expect_err("replacement response omits its identity");
+    assert!(
+        poll_and_ack(&mut executor)
+            .expect("defer identity-less replacement output")
+            .is_empty(),
+        "replacement output must not escape before its turn identity"
+    );
+    let persisted_before_loss: Value = serde_json::from_slice(
+        &fs::read(directory.join("codex-provider-state.json"))
+            .expect("read provider state before process loss"),
+    )
+    .expect("parse provider state before process loss");
+    assert_eq!(persisted_before_loss["ambiguousTurnStartPending"], true);
+    assert_ne!(
+        persisted_before_loss["lastAgentMessage"],
+        "Replacement output before terminal authority."
+    );
+
+    executor.shutdown().expect("stop first provider process");
+    drop(executor);
+
+    let mut recovered = CodexCommandExecutor::new(&directory);
+    let snapshot = recovered
+        .execute(&command("snapshot", 5, "session.snapshot", json!({})))
+        .expect("reconcile the still-active replacement turn");
+    assert_eq!(snapshot.result["status"], "turn_active");
+    assert_eq!(snapshot.result["activeProviderTurnId"], "provider-turn-2");
+    let persisted_recovered: Value = serde_json::from_slice(
+        &fs::read(directory.join("codex-provider-state.json"))
+            .expect("read recovered provider state"),
+    )
+    .expect("parse recovered provider state");
+    assert_eq!(persisted_recovered["ambiguousTurnStartPending"], false);
+    assert_ne!(
+        persisted_recovered["lastAgentMessage"],
+        "Replacement output before terminal authority."
+    );
+
+    recovered
+        .shutdown()
+        .expect("stop recovered provider process");
+    fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
+}
+
+#[test]
+fn completed_ambiguous_replacement_fails_closed_after_process_loss() {
+    let directory = temporary_directory("durable-ambiguous-completed-recovery");
+    let config = provider_config(
+        &directory,
+        &[
+            "--missing-id-second-turn-start",
+            "--complete-ambiguous-second-turn-before-response",
+            "--omit-ambiguous-turn-started",
+        ],
+    );
+    let mut executor = CodexCommandExecutor::new(&directory);
+    executor
+        .execute(&command(
+            "prepare",
+            1,
+            "run.prepare",
+            json!({"provider": config}),
+        ))
+        .expect("prepare Codex provider");
+    executor
+        .execute(&command("open", 2, "session.open", json!({})))
+        .expect("open Codex session");
+    executor
+        .execute(&command(
+            "first-turn",
+            3,
+            "turn.start",
+            json!({"text": "Complete the first turn."}),
+        ))
+        .expect("start first provider turn");
+    for _ in 0..32 {
+        if poll_and_ack(&mut executor)
+            .expect("poll first turn")
+            .iter()
+            .any(|event| event.event_type == "turn.completed")
+        {
+            break;
+        }
+    }
+
+    executor
+        .execute(&command(
+            "ambiguous-turn",
+            4,
+            "turn.start",
+            json!({"text": "Complete replacement work before returning an invalid response."}),
+        ))
+        .expect_err("replacement response omits its identity");
+    executor.shutdown().expect("stop first provider process");
+    drop(executor);
+
+    let mut recovered = CodexCommandExecutor::new(&directory);
+    let recovery_error = recovered
+        .execute(&command("snapshot", 5, "session.snapshot", json!({})))
+        .expect_err("completed ambiguous work without durable identity must fail closed");
+    assert!(
+        recovery_error
+            .to_string()
+            .contains("cannot safely recover an ambiguous Codex turn start"),
+        "unexpected ambiguous recovery error: {recovery_error}"
+    );
+    let repeated_poll_error = recovered
+        .poll_events()
+        .expect_err("a repeated poll must retain the fail-closed recovery state");
+    assert!(
+        repeated_poll_error
+            .to_string()
+            .contains("cannot safely recover an ambiguous Codex turn start"),
+        "unexpected repeated ambiguous recovery error: {repeated_poll_error}"
+    );
+    assert_eq!(call_count(&directory, "turn/start"), 2);
+    let persisted: Value = serde_json::from_slice(
+        &fs::read(directory.join("codex-provider-state.json"))
+            .expect("read fail-closed provider state"),
+    )
+    .expect("parse fail-closed provider state");
+    assert_eq!(persisted["ambiguousTurnStartPending"], true);
+    assert_eq!(persisted["completedProviderTurnId"], "provider-turn-1");
 
     fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
 }

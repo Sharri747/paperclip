@@ -166,6 +166,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let complete_ambiguous_second_turn = args
         .iter()
         .any(|value| value == "--complete-ambiguous-second-turn");
+    let retain_ambiguous_second_turn_active = args
+        .iter()
+        .any(|value| value == "--retain-ambiguous-second-turn-active");
+    let hold_ambiguous_second_turn_after_item = args
+        .iter()
+        .any(|value| value == "--hold-ambiguous-second-turn-after-item");
+    let complete_ambiguous_second_turn_before_response = args
+        .iter()
+        .any(|value| value == "--complete-ambiguous-second-turn-before-response");
     let conflicting_ambiguous_second_turn = args
         .iter()
         .any(|value| value == "--conflicting-ambiguous-second-turn");
@@ -287,16 +296,32 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     return Err("configured failure after second turn rejection".into());
                 }
                 let emits_ambiguous_turn_evidence = turn_start_count == 2
-                    && (complete_ambiguous_second_turn || conflicting_ambiguous_second_turn);
-                let provider_turn_id = if emits_ambiguous_turn_evidence {
+                    && (complete_ambiguous_second_turn
+                        || complete_ambiguous_second_turn_before_response
+                        || conflicting_ambiguous_second_turn);
+                let provider_turn_id = if emits_ambiguous_turn_evidence
+                    || (turn_start_count == 2
+                        && (retain_ambiguous_second_turn_active
+                            || hold_ambiguous_second_turn_after_item))
+                {
                     "provider-turn-2"
                 } else {
                     "provider-turn-1"
                 };
                 state.active_turn_id = Some(provider_turn_id.to_owned());
                 save_state(&state_path, &state)?;
+                if complete_ambiguous_second_turn_before_response && turn_start_count == 2 {
+                    emit_ambiguous_turn_evidence(
+                        &state_path,
+                        &mut state,
+                        !omit_ambiguous_turn_started,
+                        false,
+                    )?;
+                }
                 if fail_after_accepting_second_turn_before_response && turn_start_count == 2 {
-                    if emits_ambiguous_turn_evidence {
+                    if emits_ambiguous_turn_evidence
+                        && !complete_ambiguous_second_turn_before_response
+                    {
                         emit_ambiguous_turn_evidence(
                             &state_path,
                             &mut state,
@@ -308,7 +333,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 if malformed_error_second_turn_start && turn_start_count == 2 {
                     send(json!({"id": id, "error": {}}))?;
-                    if emits_ambiguous_turn_evidence {
+                    if emits_ambiguous_turn_evidence
+                        && !complete_ambiguous_second_turn_before_response
+                    {
                         emit_ambiguous_turn_evidence(
                             &state_path,
                             &mut state,
@@ -323,7 +350,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         "id": id,
                         "result": {"turn": {"status": "inProgress"}}
                     }))?;
-                    if emits_ambiguous_turn_evidence {
+                    if hold_ambiguous_second_turn_after_item {
+                        send(json!({
+                            "method": "item/completed",
+                            "params": {"item": {
+                                "id": "replacement-message-before-terminal",
+                                "type": "agentMessage",
+                                "status": "completed",
+                                "text": "Replacement output before terminal authority."
+                            }}
+                        }))?;
+                        continue;
+                    }
+                    if emits_ambiguous_turn_evidence
+                        && !complete_ambiguous_second_turn_before_response
+                    {
                         emit_ambiguous_turn_evidence(
                             &state_path,
                             &mut state,

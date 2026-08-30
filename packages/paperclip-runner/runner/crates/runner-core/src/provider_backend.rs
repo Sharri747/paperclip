@@ -164,6 +164,8 @@ struct CodexProviderState {
     #[serde(default)]
     active_provider_turn_id: Option<String>,
     #[serde(default)]
+    ambiguous_turn_start_pending: bool,
+    #[serde(default)]
     completed_turn_authoritative: bool,
     #[serde(default)]
     provider_process_generation: u64,
@@ -192,6 +194,7 @@ impl CodexProviderState {
             thread_id,
             provider_session_id: None,
             active_provider_turn_id: None,
+            ambiguous_turn_start_pending: false,
             completed_turn_authoritative: false,
             provider_process_generation: 0,
             completed_turn_process_generation: None,
@@ -248,6 +251,13 @@ impl CodexProviderState {
                     || self.active_provider_turn_id.is_some()
                     || matches!(self.lifecycle.as_str(), "session_open" | "turn_active")))
             || (self.lifecycle == "turn_active" && self.active_provider_turn_id.is_none())
+            || (self.ambiguous_turn_start_pending
+                && (self.thread_id.is_none()
+                    || self.active_provider_turn_id.is_some()
+                    || matches!(
+                        self.lifecycle.as_str(),
+                        "prepared" | "turn_active" | "closed"
+                    )))
             || (self.completed_turn_authoritative && self.active_provider_turn_id.is_some())
             || (!self.completed_turn_authoritative
                 && (self.completed_turn_process_generation.is_some()
@@ -311,6 +321,8 @@ impl CodexProviderState {
             self.completed_turn_authoritative = false;
             self.completed_turn_process_generation = None;
             self.completed_provider_turn_id = None;
+            self.ambiguous_turn_start_pending = false;
+            self.last_agent_message = None;
         }
         self.lifecycle = if self.active_provider_turn_id.is_some() {
             "turn_active".to_owned()
@@ -400,6 +412,7 @@ impl CodexCommandExecutor {
         let completed_turn_authoritative = state.completed_turn_authoritative;
         let completed_turn_process_generation = state.completed_turn_process_generation;
         let completed_provider_turn_id = state.completed_provider_turn_id.clone();
+        let ambiguous_turn_start_pending = state.ambiguous_turn_start_pending;
         let mut provider = CodexProvider::start_for_generation(
             &state.config,
             Some(&thread_id),
@@ -409,8 +422,22 @@ impl CodexCommandExecutor {
             DurableRunnerError::invalid(format!("failed to resume Codex provider: {error}"))
         })?;
         let recovered_active_turn_id = provider.active_provider_turn_id().map(str::to_owned);
+        if ambiguous_turn_start_pending {
+            let recovered_turn_id = recovered_active_turn_id.as_deref().ok_or_else(|| {
+                DurableRunnerError::invalid(
+                    "cannot safely recover an ambiguous Codex turn start without an active replacement turn",
+                )
+            })?;
+            if completed_provider_turn_id.as_deref() == Some(recovered_turn_id) {
+                return Err(DurableRunnerError::invalid(
+                    "ambiguous Codex turn recovery reused the previously completed turn identity",
+                ));
+            }
+        }
         provider.restore_completed_turn_authority(
-            completed_turn_authoritative && recovered_active_turn_id.is_none(),
+            completed_turn_authoritative
+                && recovered_active_turn_id.is_none()
+                && !ambiguous_turn_start_pending,
             completed_turn_process_generation,
             completed_provider_turn_id.as_deref(),
         );
@@ -419,7 +446,10 @@ impl CodexCommandExecutor {
             .as_mut()
             .expect("Codex state remains available during recovery")
             .provider_process_generation = process_generation;
-        if provider_had_exited || recovered_active_turn_id != previous_active_turn_id {
+        if provider_had_exited
+            || ambiguous_turn_start_pending
+            || recovered_active_turn_id != previous_active_turn_id
+        {
             let state = self
                 .state
                 .as_mut()
@@ -659,28 +689,37 @@ impl CodexCommandExecutor {
             .config
             .cwd
             .clone();
-        let (start_result, completion_authority_retained) = {
+        self.ensure_provider()?;
+        {
+            let state = self
+                .state
+                .as_mut()
+                .expect("Codex state remains available before turn/start dispatch");
+            state.ambiguous_turn_start_pending = true;
+        }
+        self.save_state()?;
+        let (start_result, completion_authority_retained, ambiguous_turn_start_pending) = {
             let provider = self.ensure_provider()?;
             let result = provider.start_turn(text, &cwd);
-            (result, provider.completed_turn_authority().is_some())
+            (
+                result,
+                provider.completed_turn_authority().is_some(),
+                provider.ambiguous_turn_start_pending(),
+            )
         };
         if let Err(error) = start_result {
-            if !completion_authority_retained {
-                let state = self
-                    .state
-                    .as_mut()
-                    .expect("Codex state remains available after turn/start failure");
-                let durable_authority_present = state.completed_turn_authoritative
-                    || state.completed_turn_process_generation.is_some()
-                    || state.completed_provider_turn_id.is_some();
+            let state = self
+                .state
+                .as_mut()
+                .expect("Codex state remains available after turn/start failure");
+            state.ambiguous_turn_start_pending = ambiguous_turn_start_pending;
+            if !completion_authority_retained && !ambiguous_turn_start_pending {
                 state.completed_turn_authoritative = false;
                 state.completed_turn_process_generation = None;
                 state.completed_provider_turn_id = None;
                 state.last_agent_message = None;
-                if durable_authority_present {
-                    self.save_state()?;
-                }
             }
+            self.save_state()?;
             return Err(DurableRunnerError::invalid(format!(
                 "Codex turn/start failed: {error}"
             )));
@@ -705,6 +744,7 @@ impl CodexCommandExecutor {
             .as_mut()
             .expect("Codex state exists after turn start");
         state.active_provider_turn_id = Some(provider_turn_id.clone());
+        state.ambiguous_turn_start_pending = false;
         state.completed_turn_authoritative = false;
         state.completed_turn_process_generation = None;
         state.completed_provider_turn_id = None;
@@ -789,6 +829,7 @@ impl CodexCommandExecutor {
             .as_mut()
             .ok_or_else(|| DurableRunnerError::invalid("Codex provider is not prepared"))?;
         state.active_provider_turn_id = None;
+        state.ambiguous_turn_start_pending = false;
         state.lifecycle = "closed".to_owned();
         let thread_id = state.thread_id.clone();
         self.save_state()?;
@@ -819,6 +860,11 @@ impl CodexCommandExecutor {
 
     fn poll_provider(&mut self) -> Result<(), DurableRunnerError> {
         self.restore()?;
+        // `restore_checked` records that the durable file was loaded even when
+        // provider recovery failed. Retry the provider reconciliation here so
+        // an ambiguous-start failure cannot degrade into an empty successful
+        // poll on the same executor.
+        self.restore_provider_if_needed()?;
         if self
             .state
             .as_ref()
@@ -913,6 +959,7 @@ impl CodexCommandExecutor {
                         state.completed_turn_authoritative = true;
                         state.completed_turn_process_generation = Some(process_generation);
                         state.completed_provider_turn_id = Some(provider_turn_id);
+                        state.ambiguous_turn_start_pending = false;
                         state.lifecycle = "session_open".to_owned();
                     }
                     state.extend_events(normalized)?;
@@ -1112,6 +1159,7 @@ mod tests {
             thread_id: Some("thread-1".to_owned()),
             provider_session_id: None,
             active_provider_turn_id: None,
+            ambiguous_turn_start_pending: false,
             completed_turn_authoritative: false,
             provider_process_generation: 0,
             completed_turn_process_generation: None,
@@ -1149,6 +1197,7 @@ mod tests {
         state.provider_process_generation = 1;
         state.completed_turn_process_generation = Some(1);
         state.completed_provider_turn_id = Some("turn-1".to_owned());
+        state.last_agent_message = Some("old turn output".to_owned());
 
         state.reconcile_active_provider_turn(Some("turn-2".to_owned()));
 
@@ -1157,6 +1206,7 @@ mod tests {
         assert!(!state.completed_turn_authoritative);
         assert!(state.completed_turn_process_generation.is_none());
         assert!(state.completed_provider_turn_id.is_none());
+        assert!(state.last_agent_message.is_none());
         assert!(state.validate().is_ok());
     }
 

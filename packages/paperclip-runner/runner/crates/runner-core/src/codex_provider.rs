@@ -169,6 +169,13 @@ struct BufferedProviderMessage {
     revokes_completion_reconciliation: bool,
 }
 
+enum AmbiguousTurnMessage {
+    Ready,
+    Deferred,
+    ReconciledWithStart,
+    ReconciledNeedsStart { provider_turn_id: String },
+}
+
 pub struct CodexProvider {
     process: SupervisedProcess,
     next_request_id: u64,
@@ -176,6 +183,7 @@ pub struct CodexProvider {
     provider_session_id: Option<String>,
     active_provider_turn_id: Option<String>,
     pending_messages: VecDeque<BufferedProviderMessage>,
+    deferred_ambiguous_messages: VecDeque<BufferedProviderMessage>,
     authorized_tool_ids: BTreeSet<String>,
     pending_tool_requests: BTreeMap<String, PendingToolRequest>,
     pending_tool_request_bytes: usize,
@@ -241,6 +249,7 @@ impl CodexProvider {
             provider_session_id: None,
             active_provider_turn_id: None,
             pending_messages: VecDeque::new(),
+            deferred_ambiguous_messages: VecDeque::new(),
             authorized_tool_ids,
             pending_tool_requests: BTreeMap::new(),
             pending_tool_request_bytes: 0,
@@ -308,7 +317,9 @@ impl CodexProvider {
 
         if resume_thread_id.is_some() {
             let snapshot = provider.read_thread()?;
-            provider.active_provider_turn_id = latest_active_turn_id(&snapshot);
+            provider.active_provider_turn_id = latest_active_turn_id(&snapshot)
+                .map(|turn_id| bounded_identifier(Some(&turn_id), "Codex turn id"))
+                .transpose()?;
         }
         Ok(provider)
     }
@@ -327,6 +338,10 @@ impl CodexProvider {
 
     pub fn active_provider_turn_id(&self) -> Option<&str> {
         self.active_provider_turn_id.as_deref()
+    }
+
+    pub(crate) fn ambiguous_turn_start_pending(&self) -> bool {
+        self.ambiguous_turn_start_pending
     }
 
     pub(crate) fn restore_completed_turn_authority(
@@ -397,22 +412,27 @@ impl CodexProvider {
         ) {
             Ok(result) => result,
             Err(ProviderRequestError::Rejected(error)) => {
-                self.ambiguous_turn_start_pending = false;
                 // A definite rejection proves no replacement work began.
                 // Only diagnostics without provider-work identity belong to
                 // that rejected request. Contradictory turn/item evidence or
                 // a server request must still revoke reconciliation so the
                 // prior completion cannot hide ambiguous replacement work.
-                for buffered in self
+                let definite_rejection = self
                     .pending_messages
-                    .iter_mut()
+                    .iter()
                     .skip(prior_buffered_message_count)
-                {
-                    if is_unbound_rejected_turn_diagnostic(&buffered.value) {
+                    .all(|buffered| is_unbound_rejected_turn_diagnostic(&buffered.value));
+                if definite_rejection {
+                    self.ambiguous_turn_start_pending = false;
+                    for buffered in self
+                        .pending_messages
+                        .iter_mut()
+                        .skip(prior_buffered_message_count)
+                    {
                         buffered.revokes_completion_reconciliation = false;
                     }
+                    self.completion_reconciliation_pending = prior_reconciliation_pending;
                 }
-                self.completion_reconciliation_pending = prior_reconciliation_pending;
                 return Err(error);
             }
             Err(ProviderRequestError::Ambiguous(error)) => return Err(error),
@@ -430,31 +450,30 @@ impl CodexProvider {
         Ok(result)
     }
 
-    fn reconcile_ambiguous_turn_notification(
+    fn classify_ambiguous_turn_message(
         &mut self,
         message: &Value,
-    ) -> Result<(), LocalRunnerError> {
-        if !self.ambiguous_turn_start_pending || message.get("id").is_some() {
-            return Ok(());
+    ) -> Result<AmbiguousTurnMessage, LocalRunnerError> {
+        if !self.ambiguous_turn_start_pending {
+            return Ok(AmbiguousTurnMessage::Ready);
         }
 
         let Some(method) = message.get("method").and_then(Value::as_str) else {
-            return Ok(());
+            return Ok(AmbiguousTurnMessage::Deferred);
         };
-        if !matches!(method, "turn/started" | "turn/completed") {
-            return Ok(());
-        }
-
         let params = message.get("params").cloned().unwrap_or(Value::Null);
+        let provider_turn_id = notification_turn_id(&params);
+        let identity_required = matches!(method, "turn/started" | "turn/completed");
+        if provider_turn_id.is_none() && !identity_required {
+            return Ok(AmbiguousTurnMessage::Deferred);
+        }
         validate_notification_binding(&self.thread_id, None, &params)?;
         let provider_turn_id =
-            bounded_identifier(notification_turn_id(&params), "Codex turn id").map_err(
-                |_| {
-                    LocalRunnerError::invalid(format!(
-                        "Codex {method} notification cannot resolve an ambiguous turn start without a valid turn id"
-                    ))
-                },
-            )?;
+            bounded_identifier(provider_turn_id, "Codex turn id").map_err(|_| {
+                LocalRunnerError::invalid(format!(
+                    "Codex {method} cannot resolve an ambiguous turn start without a valid turn id"
+                ))
+            })?;
 
         if self
             .completed_turn_authority
@@ -466,8 +485,12 @@ impl CodexProvider {
             )));
         }
 
-        self.accept_replacement_turn(provider_turn_id);
-        Ok(())
+        self.accept_replacement_turn(provider_turn_id.clone());
+        if method == "turn/started" && message.get("id").is_none() {
+            Ok(AmbiguousTurnMessage::ReconciledWithStart)
+        } else {
+            Ok(AmbiguousTurnMessage::ReconciledNeedsStart { provider_turn_id })
+        }
     }
 
     fn accept_replacement_turn(&mut self, provider_turn_id: String) {
@@ -590,7 +613,44 @@ impl CodexProvider {
             parse_provider_message(&line)?
         };
 
-        self.reconcile_ambiguous_turn_notification(&message)?;
+        match self.classify_ambiguous_turn_message(&message)? {
+            AmbiguousTurnMessage::Ready => {}
+            AmbiguousTurnMessage::Deferred => {
+                if self.deferred_ambiguous_messages.len() >= MAX_BUFFERED_MESSAGES {
+                    return Err(LocalRunnerError::invalid(
+                        "Codex emitted too many messages before resolving an ambiguous turn start",
+                    ));
+                }
+                self.deferred_ambiguous_messages
+                    .push_back(BufferedProviderMessage {
+                        value: message,
+                        revokes_completion_reconciliation,
+                    });
+                return Ok(None);
+            }
+            AmbiguousTurnMessage::ReconciledWithStart => {
+                let mut replay = std::mem::take(&mut self.deferred_ambiguous_messages);
+                replay.append(&mut self.pending_messages);
+                self.pending_messages = replay;
+            }
+            AmbiguousTurnMessage::ReconciledNeedsStart { provider_turn_id } => {
+                let mut replay = std::mem::take(&mut self.deferred_ambiguous_messages);
+                replay.push_back(BufferedProviderMessage {
+                    value: message,
+                    revokes_completion_reconciliation,
+                });
+                replay.append(&mut self.pending_messages);
+                self.pending_messages = replay;
+                return Ok(Some(CodexProviderEvent::Notification {
+                    method: "turn/started".to_owned(),
+                    params: json!({
+                        "threadId": self.thread_id,
+                        "turn": {"id": provider_turn_id, "status": "inProgress"},
+                        "reconciled": true,
+                    }),
+                }));
+            }
+        }
 
         if revokes_completion_reconciliation
             && self.completed_turn_authority.is_some()
