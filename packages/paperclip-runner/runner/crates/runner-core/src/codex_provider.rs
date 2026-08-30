@@ -390,12 +390,18 @@ impl CodexProvider {
             Ok(result) => result,
             Err(ProviderRequestError::Rejected(error)) => {
                 // A definite rejection proves no replacement work began.
+                // Only diagnostics without provider-work identity belong to
+                // that rejected request. Contradictory turn/item evidence or
+                // a server request must still revoke reconciliation so the
+                // prior completion cannot hide ambiguous replacement work.
                 for buffered in self
                     .pending_messages
                     .iter_mut()
                     .skip(prior_buffered_message_count)
                 {
-                    buffered.revokes_completion_reconciliation = false;
+                    if is_unbound_rejected_turn_diagnostic(&buffered.value) {
+                        buffered.revokes_completion_reconciliation = false;
+                    }
                 }
                 self.completion_reconciliation_pending = prior_reconciliation_pending;
                 return Err(error);
@@ -977,6 +983,28 @@ fn parse_provider_message(line: &str) -> Result<Value, LocalRunnerError> {
         ));
     }
     Ok(value)
+}
+
+fn is_unbound_rejected_turn_diagnostic(message: &Value) -> bool {
+    message.get("id").is_none()
+        && message.get("method").and_then(Value::as_str) == Some("warning")
+        && message
+            .get("params")
+            .is_none_or(|params| !contains_provider_work_binding(params))
+}
+
+fn contains_provider_work_binding(value: &Value) -> bool {
+    match value {
+        Value::Array(values) => values.iter().any(contains_provider_work_binding),
+        Value::Object(fields) => fields.iter().any(|(key, child)| {
+            (matches!(key.as_str(), "threadId" | "turnId" | "itemId" | "requestId")
+                && !child.is_null())
+                || (matches!(key.as_str(), "thread" | "turn" | "item" | "request")
+                    && child.get("id").is_some_and(|id| !id.is_null()))
+                || contains_provider_work_binding(child)
+        }),
+        _ => false,
+    }
 }
 
 fn validate_notification_binding(

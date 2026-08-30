@@ -125,6 +125,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let reject_second_turn_start = args
         .iter()
         .any(|value| value == "--reject-second-turn-start");
+    let emit_turn_before_rejected_second_start = args
+        .iter()
+        .any(|value| value == "--emit-turn-before-rejected-second-start");
     let malformed_error_second_turn_start = args
         .iter()
         .any(|value| value == "--malformed-error-second-turn-start");
@@ -236,6 +239,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         "method": "warning",
                         "params": {"message": "buffered before replacement rejection"}
                     }))?;
+                    if emit_turn_before_rejected_second_start {
+                        send(json!({
+                            "method": "turn/started",
+                            "params": {"turn": {"id": "provider-turn-contradiction"}}
+                        }))?;
+                    }
                     send(json!({
                         "id": id,
                         "error": {"code": -32000, "message": "replacement turn rejected"}

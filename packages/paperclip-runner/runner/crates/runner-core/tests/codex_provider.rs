@@ -624,6 +624,71 @@ fn rejected_replacement_turn_start_preserves_prior_completion_authority() {
 }
 
 #[test]
+fn rejected_replacement_turn_start_does_not_hide_contradictory_turn_evidence() {
+    let directory = temporary_directory("completion-then-contradictory-rejection");
+    let config = provider_config(
+        &directory,
+        &[
+            "--reject-second-turn-start",
+            "--emit-turn-before-rejected-second-start",
+        ],
+    );
+    let mut provider = CodexProvider::start(&config, None).expect("start Codex provider");
+    provider
+        .start_turn("Complete the first turn.", &config.cwd)
+        .expect("start first provider turn");
+    let first_completed = (0..32).any(|_| {
+        matches!(
+            provider.poll().expect("poll first turn"),
+            Some(CodexProviderEvent::Notification { method, .. })
+                if method == "turn/completed"
+        )
+    });
+    assert!(
+        first_completed,
+        "observe the authoritative first completion"
+    );
+
+    provider
+        .start_turn(
+            "Reject replacement work after contradictory evidence.",
+            &config.cwd,
+        )
+        .expect_err("the replacement turn/start returns a definite rejection");
+    let mut contradictory_turn_seen = false;
+    let rejected_start_exit = (0..64).find_map(|_| {
+        match provider
+            .poll()
+            .expect("poll exit after contradictory replacement rejection")
+        {
+            Some(CodexProviderEvent::Notification { method, params })
+                if method == "turn/started"
+                    && params.pointer("/turn/id").and_then(Value::as_str)
+                        == Some("provider-turn-contradiction") =>
+            {
+                contradictory_turn_seen = true;
+                None
+            }
+            Some(CodexProviderEvent::Exited {
+                success,
+                completed_turn_authoritative,
+                completion_reconciles_exit,
+                ..
+            }) => Some((
+                success,
+                completed_turn_authoritative,
+                completion_reconciles_exit,
+            )),
+            _ => None,
+        }
+    });
+    assert!(contradictory_turn_seen);
+    assert_eq!(rejected_start_exit, Some((false, true, false)));
+
+    fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
+}
+
+#[test]
 fn ambiguous_replacement_turn_start_preserves_prior_result_without_reconciling_exit() {
     for (label, switch) in [
         (
