@@ -135,7 +135,7 @@ import {
 } from "./activity-log.js";
 import { buildIssueChanges } from "./issue-change-receipt.js";
 import { issueThreadInteractionAttentionAgentAllowed } from "./issue-thread-interaction-resolution.js";
-import { BLOCKED_EXIT_PATCH, deriveBlockedEntryPatch } from "./routable-blocked.js";
+import { BLOCKED_EXIT_PATCH, deriveBlockedEntryPatch, ROUTABLE_BLOCKED_ROLLOUT_AT } from "./routable-blocked.js";
 
 const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"];
 const MAX_ISSUE_COMMENT_PAGE_LIMIT = 500;
@@ -7848,6 +7848,29 @@ export function issueService(db: Db) {
         // instead of leaving it permanently invisible to both
         // isProspectiveBlockedTransition callers.
         Object.assign(patch, deriveBlockedEntryPatch(existing.blockedTransitionAt, patch.updatedAt as Date));
+      } else if (
+        existing.status === "blocked"
+        && issueData.unblockDescriptor
+        && existing.blockedTransitionAt
+        && existing.blockedTransitionAt < ROUTABLE_BLOCKED_ROLLOUT_AT
+      ) {
+        // The row is already blocked and carries a stamp from before routable
+        // blocking existed -- an import of historical data, or a restore. That
+        // stamp fails isProspectiveBlockedTransition's cutoff, so attaching an
+        // unblockDescriptor to the row achieves nothing: the owner is never
+        // routed, never notified, and no later write repairs it, because the
+        // row is stamped and so looks healthy to every self-heal path.
+        //
+        // Attaching the descriptor is the moment the routable request is
+        // actually made, whatever the underlying block has been sitting there
+        // since, so the stamp advances to now and eligibility follows the
+        // request rather than the history. This fires at most once per row:
+        // afterwards the stamp is past the cutoff and this branch cannot match
+        // again. Advancing the stamp also starts a fresh dependency-wake cycle
+        // key, which is correct here -- any cycle belonging to a pre-cutoff
+        // stamp predates the feature that reads it.
+        patch.blockedTransitionAt = patch.updatedAt;
+        patch.blockedOwnerNotifiedAt = null;
       }
       if (issueData.requestDepth !== undefined) {
         patch.requestDepth = clampIssueRequestDepth(issueData.requestDepth);
