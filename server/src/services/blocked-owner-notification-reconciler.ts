@@ -48,6 +48,16 @@ export const MAX_BLOCKED_OWNER_NOTIFICATION_CANDIDATES = 250;
 // window instead of one per tick, and a transiently broken one recovers
 // quickly. The map is per process and is not persisted: losing it on restart
 // only means one extra attempt per row, which is the safe direction to fail.
+//
+// The cooldown is a rate limit on retries, not what carries the sweep past a
+// failing row. That is the cursor's job (below). The map is bounded, and once
+// more rows fail than it can hold, every new failure evicts an older one,
+// which is eligible again at once. If the batch always restarted from the
+// oldest stamp, those evicted rows would head it on every tick and the rows
+// behind them would never be reached — so the bound of an in-process map
+// would decide whether a deliverable row was ever seen. With the cursor, an
+// evicted row is only re-attempted when the sweep comes round to it again,
+// and the bound decides only how often a broken row is retried.
 export const DELIVERY_FAILURE_BASE_COOLDOWN_MS = 60_000;
 export const DELIVERY_FAILURE_MAX_COOLDOWN_MS = 60 * 60_000;
 export const MAX_TRACKED_DELIVERY_FAILURES = 5_000;
@@ -99,9 +109,19 @@ export function blockedOwnerNotificationReconcilerService(
     return cooling;
   }
 
+  // Where the previous tick's batch ended, per sweep scope. The next tick
+  // resumes strictly after it, so a batch never restarts from the head of the
+  // queue while there are rows further along that have not had a turn. When a
+  // tick comes back short the queue has been covered once, and the cursor
+  // wraps to the start. The key is (stamp, id): stamps can tie, and id breaks
+  // the tie deterministically so no row is skipped or repeated at a boundary.
+  const cursors = new Map<string, { blockedTransitionAt: Date; id: string }>();
+
   async function reconcileBlockedOwnerNotifications(opts?: { companyId?: string }) {
     const tickStartedAt = (deps.now ?? (() => new Date()))().getTime();
     const coolingDown = cooldownIssueIds(tickStartedAt);
+    const cursorKey = opts?.companyId ?? "";
+    const cursor = cursors.get(cursorKey);
     // The batch must contain only rows this sweep can actually deliver.
     // `deliverAgentUnblockNotification` no-ops on a board-owned descriptor and
     // on a stamp older than the rollout cutover, and those two classes are
@@ -110,7 +130,11 @@ export function blockedOwnerNotificationReconcilerService(
     // the deliverable rows behind them are never reached. Excluding them in SQL
     // means every row in the batch can make progress, so the backlog drains.
     // Oldest transition first, so a large backlog drains in a fair order rather
-    // than an arbitrary one.
+    // than an arbitrary one; resumed from the cursor, so a row that stays
+    // eligible after its turn — a delivery that failed, a fence that did not
+    // apply — cannot take the head of the next batch away from the rows that
+    // have not yet been reached. Every eligible row gets a turn per pass over
+    // the queue, however many rows ahead of it are broken.
     const candidates = await db
       .select()
       .from(issues)
@@ -124,10 +148,22 @@ export function blockedOwnerNotificationReconcilerService(
           gte(issues.blockedTransitionAt, ROUTABLE_BLOCKED_ROLLOUT_AT),
           sql`${issues.unblockDescriptor} -> 'owner' ->> 'agentId' is not null`,
           coolingDown.length > 0 ? notInArray(issues.id, coolingDown) : undefined,
+          cursor
+            ? sql`(${issues.blockedTransitionAt}, ${issues.id}) > (${cursor.blockedTransitionAt.toISOString()}::timestamptz, ${cursor.id}::uuid)`
+            : undefined,
         ),
       )
-      .orderBy(asc(issues.blockedTransitionAt))
+      .orderBy(asc(issues.blockedTransitionAt), asc(issues.id))
       .limit(MAX_BLOCKED_OWNER_NOTIFICATION_CANDIDATES);
+
+    const last = candidates.at(-1);
+    if (candidates.length < MAX_BLOCKED_OWNER_NOTIFICATION_CANDIDATES || !last?.blockedTransitionAt) {
+      // Short batch: everything past the cursor has been covered. Start from
+      // the head again next tick.
+      cursors.delete(cursorKey);
+    } else {
+      cursors.set(cursorKey, { blockedTransitionAt: last.blockedTransitionAt, id: last.id });
+    }
 
     const result = {
       scanned: candidates.length,
