@@ -10,6 +10,7 @@ import {
   blockedOwnerNotificationReconcilerService,
   DELIVERY_FAILURE_BASE_COOLDOWN_MS,
   MAX_BLOCKED_OWNER_NOTIFICATION_CANDIDATES,
+  MAX_TRACKED_DELIVERY_FAILURES,
 } from "../services/blocked-owner-notification-reconciler.js";
 import { ROUTABLE_BLOCKED_ROLLOUT_AT } from "../services/routable-blocked.js";
 
@@ -394,4 +395,74 @@ describeEmbeddedPostgres("blocked-owner notification reconciler", () => {
     expect(third).toMatchObject({ scanned: 1, failed: 1 });
     expect(third.failedIssueIds).toEqual([brokenId]);
   });
+
+  // Greptile finding on the third review round: the cooldown map is bounded,
+  // and once more permanently failing rows than the bound sit ahead of a
+  // deliverable one, every new failure evicts an older one. The evicted row is
+  // eligible again at once and, oldest-first, heads the next batch — so the
+  // batch is refilled with recycled failures on every tick and the deliverable
+  // row behind them is never reached. Progress through the candidate set must
+  // not depend on the bound of an in-process map.
+  it("reaches a deliverable row behind more permanently failing rows than the cooldown map can track", async () => {
+    const { companyId, agentId } = await createCompany("BOL");
+    const oldest = new Date(ROUTABLE_BLOCKED_ROLLOUT_AT.getTime() + 1000);
+    // One more full batch than the map can hold, so the map is forced to evict
+    // before the sweep has been past every failing row once.
+    const failingCount = MAX_TRACKED_DELIVERY_FAILURES + MAX_BLOCKED_OWNER_NOTIFICATION_CANDIDATES;
+    const failingIds = new Set<string>();
+    const rows: Array<typeof issues.$inferInsert> = [];
+    for (let i = 0; i < failingCount; i += 1) {
+      const id = randomUUID();
+      failingIds.add(id);
+      rows.push({
+        id,
+        companyId,
+        title: `Owner agent is uninvokable ${i}`,
+        status: "blocked",
+        unblockDescriptor: { owner: { agentId }, action: "Never deliverable" },
+        blockedTransitionAt: new Date(oldest.getTime() + i * 1000),
+        blockedOwnerNotifiedAt: null,
+      });
+    }
+    for (let offset = 0; offset < rows.length; offset += 500) {
+      await db.insert(issues).values(rows.slice(offset, offset + 500));
+    }
+    const deliverableId = await insertBlockedIssue({
+      companyId,
+      title: "Deliverable, but behind every failing row",
+      unblockDescriptor: { owner: { agentId }, action: "Rule on the four options" },
+      blockedTransitionAt: new Date(oldest.getTime() + failingCount * 1000),
+    });
+
+    let clock = Date.now();
+    const wakeup = vi.fn(async (_agentId: string, opts: { payload?: { issueId?: string } }) => {
+      if (opts.payload?.issueId && failingIds.has(opts.payload.issueId)) {
+        throw new Error("agent is not invokable");
+      }
+      return undefined;
+    });
+    const reconciler = blockedOwnerNotificationReconcilerService(db, {
+      wakeup: wakeup as never,
+      now: () => new Date(clock),
+    });
+
+    // Tick faster than the base cooldown, so no failure expires during the
+    // run: every failing row the sweep has seen is still inside its cooldown,
+    // and only the map's bound decides which of them are eligible again.
+    const ticksToCoverEveryRowOnce = Math.ceil((failingCount + 1) / MAX_BLOCKED_OWNER_NOTIFICATION_CANDIDATES);
+    let deliveredOnTick: number | null = null;
+    for (let tick = 1; tick <= ticksToCoverEveryRowOnce + 2; tick += 1) {
+      const result = await reconciler.reconcileBlockedOwnerNotifications({ companyId });
+      if (result.notifiedIssueIds.includes(deliverableId)) {
+        deliveredOnTick = tick;
+        break;
+      }
+      clock += 10_000;
+    }
+
+    expect(deliveredOnTick).not.toBeNull();
+    expect(deliveredOnTick).toBeLessThanOrEqual(ticksToCoverEveryRowOnce + 1);
+    const row = await readIssue(deliverableId);
+    expect(row?.blockedOwnerNotifiedAt).not.toBeNull();
+  }, 120_000);
 });
