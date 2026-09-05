@@ -16,6 +16,7 @@ import { logActivity } from "./activity-log.js";
 import { budgetService } from "./budgets.js";
 import { issueService } from "./issues.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
+import { hasScheduledIssueMonitorPath } from "./recovery/issue-graph-liveness.js";
 import { withRecoveryContext } from "./recovery/status-only-context.js";
 import { RECOVERY_ORIGIN_KINDS } from "./recovery/origins.js";
 
@@ -77,6 +78,7 @@ type ProductivityReviewEvidence = {
   commentCountLastHour: number;
   commentCountLastSixHours: number;
   elapsedMs: number | null;
+  monitorNextCheckAt: Date | null;
   latestRuns: ProductivityRunSample[];
   latestComments: Array<typeof issueComments.$inferSelect>;
   costCents: number;
@@ -143,6 +145,12 @@ function readPositiveInteger(value: number, fallback: number) {
 function coerceDate(value: Date | string | null | undefined) {
   if (!value) return null;
   return value instanceof Date ? value : new Date(value);
+}
+
+function formatMonitorNextCheck(nextCheckAt: Date | null, now: Date) {
+  if (!nextCheckAt) return "none";
+  const iso = nextCheckAt.toISOString();
+  return nextCheckAt.getTime() > now.getTime() ? `next check at ${iso}` : `check was due at ${iso} (overdue)`;
 }
 
 function buildThresholds(overrides?: Partial<ProductivityReviewThresholds>): ProductivityReviewThresholds {
@@ -542,9 +550,16 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     const elapsedMs = sourceIssue.status === "in_progress" && activeStartedAt
       ? Math.max(0, now.getTime() - activeStartedAt.getTime())
       : null;
+    // An issue parked on a scheduled monitor (future nextCheckAt, not timed out, attempts
+    // not exhausted) is deliberately waiting for an external event. Wall-clock time spent
+    // in that wait is not evidence of an unproductive active episode, so the duration
+    // trigger stays quiet until the monitor is due or cleared. The same definition of a
+    // live monitor path is used by stranded-issue recovery, so both agree on "waiting".
+    const waitingOnScheduledMonitor = hasScheduledIssueMonitorPath(sourceIssue, now);
+    const monitorNextCheckAt = coerceDate(sourceIssue.monitorNextCheckAt);
 
     const noComment = noCommentStreak >= thresholds.noCommentStreakRuns;
-    const longActive = elapsedMs !== null && elapsedMs >= thresholds.longActiveMs;
+    const longActive = !waitingOnScheduledMonitor && elapsedMs !== null && elapsedMs >= thresholds.longActiveMs;
     const highChurn =
       runCountLastHour >= thresholds.highChurnHourly ||
       assigneeRunCommentCountLastHour >= thresholds.highChurnHourly ||
@@ -577,6 +592,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       commentCountLastHour: assigneeRunCommentCountLastHour,
       commentCountLastSixHours: assigneeRunCommentCountLastSixHours,
       elapsedMs,
+      monitorNextCheckAt,
       latestRuns: latestRuns.slice(0, 5),
       latestComments,
       costCents: costRow.costCents,
@@ -656,6 +672,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       `- Active queued/running/scheduled runs: ${evidence.activeRunCount}`,
       `- No-comment completed-run streak: ${evidence.noCommentStreak}`,
       `- Current active elapsed time: ${msToHuman(evidence.elapsedMs)}`,
+      `- Scheduled monitor: ${formatMonitorNextCheck(evidence.monitorNextCheckAt, evidence.generatedAt)}`,
       `- Runs in rolling windows: ${evidence.runCountLastHour}/1h, ${evidence.runCountLastSixHours}/6h`,
       `- Assignee run-linked comments total/window: ${evidence.commentCount} total, ${evidence.commentCountLastHour}/1h, ${evidence.commentCountLastSixHours}/6h`,
       `- Cost events total: ${evidence.costCents} cents`,

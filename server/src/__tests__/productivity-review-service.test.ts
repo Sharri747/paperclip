@@ -505,6 +505,106 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(hold.held).toBe(false);
   });
 
+  it("does not raise a long-active review while the issue is idle on a scheduled monitor with a future check", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const nextCheckAt = new Date(now.getTime() + 12 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    await db
+      .update(issues)
+      .set({
+        monitorNextCheckAt: nextCheckAt,
+        monitorScheduledBy: "assignee",
+        monitorAttemptCount: 1,
+        executionPolicy: {
+          mode: "normal",
+          commentRequired: true,
+          stages: [],
+          monitor: {
+            kind: "external_service",
+            serviceName: "github",
+            nextCheckAt: nextCheckAt.toISOString(),
+            notes: "Recheck upstream PR",
+            scheduledBy: "assignee",
+            recoveryPolicy: "wake_owner",
+          },
+        },
+        executionState: {
+          status: "idle",
+          currentStageId: null,
+          currentStageIndex: null,
+          currentStageType: null,
+          currentParticipant: null,
+          returnAssignee: null,
+          reviewRequest: null,
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+          monitor: {
+            kind: "external_service",
+            serviceName: "github",
+            status: "scheduled",
+            nextCheckAt: nextCheckAt.toISOString(),
+            lastTriggeredAt: null,
+            attemptCount: 1,
+            notes: "Recheck upstream PR",
+            scheduledBy: "assignee",
+            recoveryPolicy: "wake_owner",
+            clearedAt: null,
+            clearReason: null,
+          },
+        },
+      })
+      .where(eq(issues.id, seeded.issueId));
+    const service = productivityReviewService(db);
+
+    const monitored = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(monitored.created).toBe(0);
+    expect(monitored.skipped).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+
+    // Once the scheduled check is due (or the monitor is cleared), the duration clock counts again.
+    const afterDue = new Date(nextCheckAt.getTime() + 60_000);
+    const due = await service.reconcileProductivityReviews({ now: afterDue, companyId: seeded.companyId });
+
+    expect(due.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+    expect(review?.description).toContain(`Scheduled monitor: check was due at ${nextCheckAt.toISOString()} (overdue)`);
+  });
+
+  it("still raises a high-churn review on a monitor-scheduled issue when the run rate is anomalous", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const nextCheckAt = new Date(now.getTime() + 12 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    await db
+      .update(issues)
+      .set({ monitorNextCheckAt: nextCheckAt, monitorScheduledBy: "assignee" })
+      .where(eq(issues.id, seeded.issueId));
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 10,
+      now,
+      withRunComments: true,
+    });
+    const service = productivityReviewService(db);
+
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `high_churn`");
+    expect(review?.description).not.toContain("current active episode has lasted");
+  });
+
   it("skips a long-active candidate while its assignee is paused and reviews it once unpaused", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue({

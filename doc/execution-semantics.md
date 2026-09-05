@@ -493,6 +493,8 @@ Because `serviceName` and `notes` remain visible in issue activity and wake cont
 
 Monitor bounds are enforced. Paperclip rejects attempts to re-arm a monitor whose `timeoutAt` or `maxAttempts` is already exhausted. When a scheduled monitor reaches an exhausted bound at trigger time, Paperclip clears it and follows `recoveryPolicy`: `wake_owner` queues a bounded recovery wake for the assignee, `create_recovery_issue` opens visible issue-backed recovery work, and `escalate_to_board` records a board-visible escalation comment/activity.
 
+A scheduled monitor is a deliberate wait, not stalled work. While an `in_progress` issue has a live monitor path (future `nextCheckAt`, not timed out, attempts not exhausted), the productivity reviewer does not count that wall-clock time toward its `long_active_duration` trigger; the duration clock resumes when the monitor fires or is cleared without being re-armed. The `no_comment_streak` and `high_churn` triggers still apply, because a monitor does not explain a run-rate or silence anomaly.
+
 Use `blocked` instead of a monitor when no Paperclip assignee owns a responsible polling path. In that case, name the external owner/action or create first-class recovery/blocker work.
 
 ### `blocked`
