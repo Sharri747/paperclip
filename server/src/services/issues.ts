@@ -5049,6 +5049,28 @@ export function issueService(db: Db) {
   ) {
     const deduped = [...new Set(labelIds)];
     await assertValidLabelIds(companyId, deduped, dbOrTx);
+    // Lock the parent label rows before touching `issue_labels`, and always in
+    // the same (id) order. `deleteLabel` locks the label row FOR UPDATE and
+    // then removes that label's `issue_labels` rows; without this step the
+    // two transactions take the same locks in opposite order (this one:
+    // child rows first, then the parent via the insert's FOR KEY SHARE) and
+    // can deadlock. Locking the union of the current and requested labels
+    // covers both the rows deleted below and the rows inserted below. A
+    // label deleted concurrently simply no longer appears in the lock set —
+    // its association rows are already gone by cascade.
+    const current = await dbOrTx
+      .select({ labelId: issueLabels.labelId })
+      .from(issueLabels)
+      .where(eq(issueLabels.issueId, issueId));
+    const toLock = [...new Set([...deduped, ...current.map((row: { labelId: string }) => row.labelId)])].sort();
+    if (toLock.length > 0) {
+      await dbOrTx
+        .select({ id: labels.id })
+        .from(labels)
+        .where(inArray(labels.id, toLock))
+        .orderBy(asc(labels.id))
+        .for("key share");
+    }
     await dbOrTx.delete(issueLabels).where(eq(issueLabels.issueId, issueId));
     if (deduped.length === 0) return;
     await dbOrTx.insert(issueLabels).values(
