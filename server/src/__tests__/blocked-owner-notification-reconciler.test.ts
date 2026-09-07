@@ -465,4 +465,73 @@ describeEmbeddedPostgres("blocked-owner notification reconciler", () => {
     const row = await readIssue(deliverableId);
     expect(row?.blockedOwnerNotifiedAt).not.toBeNull();
   }, 120_000);
+  it("wraps to the head after a pass even when new rows keep filling every batch", async () => {
+    const { companyId, agentId } = await createCompany("BOW");
+    const oldest = new Date(ROUTABLE_BLOCKED_ROLLOUT_AT.getTime() + 1000);
+    // The row that must not starve: oldest stamp, fails once, then delivers.
+    const flakyId = await insertBlockedIssue({
+      companyId,
+      title: "Delivery fails once, then works",
+      unblockDescriptor: { owner: { agentId }, action: "Rule on the four options" },
+      blockedTransitionAt: oldest,
+    });
+    // Enough deliverable rows behind it that the first pass takes several ticks.
+    const initialCount = MAX_BLOCKED_OWNER_NOTIFICATION_CANDIDATES * 2 + 100;
+    let nextStamp = oldest.getTime() + 1000;
+    const bulkInsert = async (count: number, title: string) => {
+      const rows: Array<typeof issues.$inferInsert> = [];
+      for (let i = 0; i < count; i += 1) {
+        rows.push({
+          id: randomUUID(),
+          companyId,
+          title: `${title} ${i}`,
+          status: "blocked",
+          unblockDescriptor: { owner: { agentId }, action: "Deliverable" },
+          blockedTransitionAt: new Date(nextStamp),
+          blockedOwnerNotifiedAt: null,
+        });
+        nextStamp += 1000;
+      }
+      for (let offset = 0; offset < rows.length; offset += 500) {
+        await db.insert(issues).values(rows.slice(offset, offset + 500));
+      }
+    };
+    await bulkInsert(initialCount, "Initial backlog");
+
+    let clock = Date.now();
+    let flakyAttempts = 0;
+    const wakeup = vi.fn(async (_agentId: string, opts: { payload?: { issueId?: string } }) => {
+      if (opts.payload?.issueId === flakyId) {
+        flakyAttempts += 1;
+        if (flakyAttempts === 1) throw new Error("transient delivery failure");
+      }
+      return undefined;
+    });
+    const reconciler = blockedOwnerNotificationReconcilerService(db, {
+      wakeup: wakeup as never,
+      now: () => new Date(clock),
+    });
+
+    // Tick 1 fails the flaky row and moves the cursor past it. From then on a
+    // full batch of new rows arrives before every tick, so no batch ever
+    // comes back short: only the pass bound can bring the cursor back to the
+    // head. The flaky row's cooldown expires long before the pass ends.
+    const passTicks = Math.ceil((initialCount + 1) / MAX_BLOCKED_OWNER_NOTIFICATION_CANDIDATES);
+    let deliveredOnTick: number | null = null;
+    for (let tick = 1; tick <= passTicks + 3; tick += 1) {
+      if (tick > 1) await bulkInsert(MAX_BLOCKED_OWNER_NOTIFICATION_CANDIDATES, `Arrived before tick ${tick}`);
+      const result = await reconciler.reconcileBlockedOwnerNotifications({ companyId });
+      if (result.notifiedIssueIds.includes(flakyId)) {
+        deliveredOnTick = tick;
+        break;
+      }
+      clock += DELIVERY_FAILURE_BASE_COOLDOWN_MS * 2;
+    }
+
+    expect(flakyAttempts).toBe(2);
+    expect(deliveredOnTick).toBe(passTicks + 1);
+    const row = await readIssue(flakyId);
+    expect(row?.blockedOwnerNotifiedAt).not.toBeNull();
+  }, 120_000);
 });
+

@@ -1,4 +1,4 @@
-import { and, asc, eq, gte, isNotNull, isNull, notInArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, isNotNull, isNull, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { issues } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
@@ -111,11 +111,55 @@ export function blockedOwnerNotificationReconcilerService(
 
   // Where the previous tick's batch ended, per sweep scope. The next tick
   // resumes strictly after it, so a batch never restarts from the head of the
-  // queue while there are rows further along that have not had a turn. When a
-  // tick comes back short the queue has been covered once, and the cursor
-  // wraps to the start. The key is (stamp, id): stamps can tie, and id breaks
-  // the tie deterministically so no row is skipped or repeated at a boundary.
-  const cursors = new Map<string, { blockedTransitionAt: Date; id: string }>();
+  // queue while there are rows further along that have not had a turn. The
+  // key is (stamp, id): stamps can tie, and id breaks the tie
+  // deterministically so no row is skipped or repeated at a boundary.
+  //
+  // A pass is bounded to the rows that were eligible when it started: its
+  // end key is read once, at the first tick of the pass, and the cursor wraps
+  // to the head as soon as a batch reaches that key — or comes back short,
+  // whichever is first. Without the bound, a backlog that refills every batch
+  // (new rows arriving faster than a batch drains them) would keep the cursor
+  // advancing forever, and a row behind it — a failure whose cooldown has
+  // expired, or a row made eligible with an older stamp — would never be
+  // reached. With it, a pass is at most ceil(N / batch) ticks for the N rows
+  // that existed at its start, and every row behind the cursor gets its turn
+  // on the next pass.
+  const cursors = new Map<string, { blockedTransitionAt: Date; id: string; passEnd: CursorKey }>();
+
+  type CursorKey = { blockedTransitionAt: Date; id: string };
+
+  function compareCursorKeys(a: CursorKey, b: CursorKey): number {
+    const byStamp = a.blockedTransitionAt.getTime() - b.blockedTransitionAt.getTime();
+    if (byStamp !== 0) return byStamp;
+    return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+  }
+
+  // The greatest (stamp, id) among the rows the sweep could ever select, read
+  // once at the start of a pass. Cooldown is deliberately not applied here: a
+  // cooling row is still part of the queue, and excluding it would let the
+  // pass end early whenever the tail happens to be failing.
+  async function readPassEnd(companyId?: string): Promise<CursorKey | null> {
+    const [row] = await db
+      .select({ blockedTransitionAt: issues.blockedTransitionAt, id: issues.id })
+      .from(issues)
+      .where(and(...eligibilityConditions(companyId)))
+      .orderBy(desc(issues.blockedTransitionAt), desc(issues.id))
+      .limit(1);
+    return row?.blockedTransitionAt ? { blockedTransitionAt: row.blockedTransitionAt, id: row.id } : null;
+  }
+
+  function eligibilityConditions(companyId?: string) {
+    return [
+      companyId ? eq(issues.companyId, companyId) : undefined,
+      visibleIssueCondition(),
+      eq(issues.status, "blocked"),
+      isNotNull(issues.unblockDescriptor),
+      isNull(issues.blockedOwnerNotifiedAt),
+      gte(issues.blockedTransitionAt, ROUTABLE_BLOCKED_ROLLOUT_AT),
+      sql`${issues.unblockDescriptor} -> 'owner' ->> 'agentId' is not null`,
+    ];
+  }
 
   async function reconcileBlockedOwnerNotifications(opts?: { companyId?: string }) {
     const tickStartedAt = (deps.now ?? (() => new Date()))().getTime();
@@ -140,13 +184,7 @@ export function blockedOwnerNotificationReconcilerService(
       .from(issues)
       .where(
         and(
-          opts?.companyId ? eq(issues.companyId, opts.companyId) : undefined,
-          visibleIssueCondition(),
-          eq(issues.status, "blocked"),
-          isNotNull(issues.unblockDescriptor),
-          isNull(issues.blockedOwnerNotifiedAt),
-          gte(issues.blockedTransitionAt, ROUTABLE_BLOCKED_ROLLOUT_AT),
-          sql`${issues.unblockDescriptor} -> 'owner' ->> 'agentId' is not null`,
+          ...eligibilityConditions(opts?.companyId),
           coolingDown.length > 0 ? notInArray(issues.id, coolingDown) : undefined,
           cursor
             ? sql`(${issues.blockedTransitionAt}, ${issues.id}) > (${cursor.blockedTransitionAt.toISOString()}::timestamptz, ${cursor.id}::uuid)`
@@ -157,12 +195,18 @@ export function blockedOwnerNotificationReconcilerService(
       .limit(MAX_BLOCKED_OWNER_NOTIFICATION_CANDIDATES);
 
     const last = candidates.at(-1);
-    if (candidates.length < MAX_BLOCKED_OWNER_NOTIFICATION_CANDIDATES || !last?.blockedTransitionAt) {
-      // Short batch: everything past the cursor has been covered. Start from
-      // the head again next tick.
+    const passEnd = cursor?.passEnd ?? (last?.blockedTransitionAt ? await readPassEnd(opts?.companyId) : null);
+    if (
+      candidates.length < MAX_BLOCKED_OWNER_NOTIFICATION_CANDIDATES ||
+      !last?.blockedTransitionAt ||
+      !passEnd ||
+      compareCursorKeys({ blockedTransitionAt: last.blockedTransitionAt, id: last.id }, passEnd) >= 0
+    ) {
+      // Short batch, or the batch reached the last row that was eligible when
+      // this pass began: the pass is complete. Start from the head next tick.
       cursors.delete(cursorKey);
     } else {
-      cursors.set(cursorKey, { blockedTransitionAt: last.blockedTransitionAt, id: last.id });
+      cursors.set(cursorKey, { blockedTransitionAt: last.blockedTransitionAt, id: last.id, passEnd });
     }
 
     const result = {
